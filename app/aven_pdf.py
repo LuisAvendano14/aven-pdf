@@ -827,20 +827,28 @@ if __name__ == "__main__":
             except KeyboardInterrupt:
                 pass
 
-        # La ventana corre en un PROCESO HIJO: si la ventana propia se
-        # estrella a nivel nativo (sin traceback posible, como pasaba en
-        # algunas PC), el servidor sobrevive y entra el respaldo en vez
-        # de que no abra nada.
+        # La ventana corre en un PROCESO HIJO y debe PROBAR que abrió:
+        # escribe una señal cuando la página carga dentro de ella. Si el
+        # hijo muere antes de la señal, o pasan 25 s sin señal (estrellón
+        # nativo que deja el proceso zombi, como pasaba en algunas PC),
+        # el servidor sobrevive y entra el respaldo en vez de no abrir nada.
+        _marca = _os.path.join(_dir, "aven_ventana.ok")
+        try: _os.remove(_marca)
+        except Exception: pass
         _hijo = _sp.Popen([sys.executable, _os.path.abspath(__file__), "--solo-ventana"])
         _t0 = time.time()
-        _murio = False
-        while time.time() - _t0 < 6:
+        _bien = False
+        while time.time() - _t0 < 25:
+            if _os.path.exists(_marca):
+                _bien = True
+                break
             if _hijo.poll() is not None:
-                _murio = True
                 break
             time.sleep(0.3)
-        if _murio:
-            _log("la ventana propia se cerro al arrancar (codigo %s); va el respaldo" % _hijo.returncode)
+        if not _bien:
+            _log("la ventana propia no llego a abrir (sin señal en 25 s); va el respaldo")
+            try: _hijo.kill()
+            except Exception: pass
             _respaldo_edge()
         else:
             _log("ventana propia en marcha")
@@ -868,8 +876,17 @@ if __name__ == "__main__":
             _log("importando pywebview...")
             import webview
             _log("pywebview importado; creando la ventana")
-            webview.create_window("Aven PDF", "http://127.0.0.1:8890",
+            _win = webview.create_window("Aven PDF", "http://127.0.0.1:8890",
                                   width=1440, height=950, min_size=(1000, 700))
+            def _senal():
+                # La página cargó dentro de la ventana: avisar al padre.
+                try:
+                    with open(_os.path.join(_dir, "aven_ventana.ok"), "w", encoding="utf-8") as f:
+                        f.write("ok")
+                except Exception:
+                    pass
+            try: _win.events.loaded += _senal
+            except Exception: pass
             try:
                 webview.start(gui="edgechromium")
             except TypeError:
