@@ -21,11 +21,14 @@ open(BASE + "/python/python313._pth", "w").write(
 SP = BASE + "/python/Lib/site-packages"
 os.makedirs(SP, exist_ok=True)
 count = 0
-# Si la carpeta de ruedas trae DOS versiones del mismo paquete, integrar
-# AMBAS sobrepone sus archivos y el paquete queda roto (pasó con Pillow: su
-# parte Python quedó de una versión y su núcleo compilado _imaging de otra,
-# y TODO lo que usa PIL reventaba en la PC del usuario). Se integra solo la
-# versión mayor de cada paquete.
+# Dos candados contra paquetes rotos en el payload:
+# (a) Si la carpeta trae DOS versiones del mismo paquete, integrar AMBAS
+#     sobrepone sus archivos y el paquete queda roto (pasó con Pillow).
+#     Se integra solo la versión mayor de cada paquete.
+# (b) El Python incrustado del paquete es 3.13: solo sirven ruedas cp313,
+#     abi3 o universales. Una rueda de OTRO Python (p. ej. cp314, si el
+#     python del runner cambió) se ve igual pero el programa no la puede
+#     cargar: es el error «cannot import name '_imaging'».
 def _rueda_info(nombre):
     partes = nombre[:-4].split("-")
     return partes[0].lower(), (partes[1] if len(partes) > 1 else "0")
@@ -40,9 +43,24 @@ def _version_tupla(v):
         nums.append(int(dig) if dig else 0)
     return tuple(nums)
 
+import re as _re
+def _compatible(nombre):
+    low = nombre.lower()
+    if "abi3" in low or "none-any" in low or "py2.py3" in low:
+        return True
+    if "cp313" in low:
+        return True
+    if _re.search(r"cp3\d+", low):
+        return False
+    return True
+
 _elegidas = {}
 for _whl in glob.glob("build/wheels/*.whl"):
-    _dist, _ver = _rueda_info(os.path.basename(_whl))
+    _nombre = os.path.basename(_whl)
+    if not _compatible(_nombre):
+        print("rueda omitida (es de otro Python):", _nombre)
+        continue
+    _dist, _ver = _rueda_info(_nombre)
     if _dist not in _elegidas or _version_tupla(_ver) > _version_tupla(_rueda_info(os.path.basename(_elegidas[_dist]))[1]):
         _elegidas[_dist] = _whl
 
@@ -72,6 +90,12 @@ for whl in sorted(_elegidas.values()):
             with z.open(name) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
     count += 1
+
+# Control de cordura: el núcleo compilado de Pillow para cp313 debe estar
+# dentro del paquete; si no está, las ruedas se descargaron para otro
+# Python y todo lo que usa PIL fallaría en la PC del usuario.
+if not any("cp313" in os.path.basename(p) for p in glob.glob(SP + "/PIL/_imaging*.pyd")):
+    raise SystemExit("ERROR: falta PIL/_imaging para cp313 en el paquete: las ruedas se descargaron para otro Python (corregir el paso de descarga del workflow)")
 
 # 3) proxy_tools solo existe como .tar.gz
 for sdist in glob.glob("build/wheels/proxy_tools-*.tar.gz"):
@@ -112,6 +136,8 @@ if os.path.exists(_exe):
                    "print('Pillow OK', PIL.__version__)"),
         ("PyMuPDF", "import pymupdf; d = pymupdf.open(); d.new_page(); "
                     "print('PyMuPDF OK', getattr(pymupdf, '__version__', ''))"),
+        ("onnxruntime", "import onnxruntime; "
+                        "print('onnxruntime OK', onnxruntime.__version__)"),
     ]
     for _nombre_p, _codigo in _pruebas:
         _r = subprocess.run([_exe, "-c", _codigo], capture_output=True, text=True)
