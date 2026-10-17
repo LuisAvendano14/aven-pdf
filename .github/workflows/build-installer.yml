@@ -22,8 +22,8 @@ jobs:
       - name: Descargar las librerias (versiones de Windows)
         shell: pwsh
         run: |
-          python -m pip download -d build/wheels pypdf pymupdf cryptography pdf2docx endesive pdfplumber openpyxl rapidocr-onnxruntime pywebview
-          python -m pip download -d build/wheels --no-deps pythonnet clr_loader bottle proxy-tools
+          python -m pip download -d build/wheels --only-binary :all: --platform win_amd64 --python-version 3.13 --implementation cp pypdf pymupdf cryptography pdf2docx endesive pdfplumber openpyxl rapidocr-onnxruntime pywebview
+          python -m pip download -d build/wheels --platform win_amd64 --python-version 3.13 --implementation cp --no-deps pythonnet clr_loader bottle proxy-tools
 
       - name: Armar el paquete del programa (payload)
         run: python assemble_win.py
