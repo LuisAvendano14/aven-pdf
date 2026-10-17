@@ -55,7 +55,19 @@ for sdist in glob.glob("build/wheels/proxy_tools-*.tar.gz"):
             if m.name.endswith("proxy_tools.py"):
                 open(SP + "/proxy_tools.py", "wb").write(t.extractfile(m).read())
 
+# 3.5) Runtime de Visual C++ junto al programa: onnxruntime (OCR) lo
+# necesita y no toda PC lo trae; sin el, el OCR muere con "DLL load failed".
+sys32 = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32")
+for dll in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll"):
+    src = os.path.join(sys32, dll)
+    if os.path.exists(src):
+        shutil.copy(src, BASE + "/python/" + dll)
+        capi = os.path.join(SP, "onnxruntime", "capi")
+        if os.path.isdir(capi):
+            shutil.copy(src, os.path.join(capi, dll))
+
 # 4) La aplicacion
 shutil.copy("app/aven_pdf.py", BASE + "/app/aven_pdf.py")
+shutil.copy("app/aven_ui.py", BASE + "/app/aven_ui.py")
 shutil.copy("app/aven.ico", BASE + "/app/aven.ico")
 print("payload listo:", count, "ruedas integradas")
