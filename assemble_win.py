@@ -21,7 +21,32 @@ open(BASE + "/python/python313._pth", "w").write(
 SP = BASE + "/python/Lib/site-packages"
 os.makedirs(SP, exist_ok=True)
 count = 0
-for whl in sorted(glob.glob("build/wheels/*.whl")):
+# Si la carpeta de ruedas trae DOS versiones del mismo paquete, integrar
+# AMBAS sobrepone sus archivos y el paquete queda roto (pasó con Pillow: su
+# parte Python quedó de una versión y su núcleo compilado _imaging de otra,
+# y TODO lo que usa PIL reventaba en la PC del usuario). Se integra solo la
+# versión mayor de cada paquete.
+def _rueda_info(nombre):
+    partes = nombre[:-4].split("-")
+    return partes[0].lower(), (partes[1] if len(partes) > 1 else "0")
+
+def _version_tupla(v):
+    nums = []
+    for trozo in v.replace("+", ".").split("."):
+        dig = ""
+        for ch in trozo:
+            if ch.isdigit(): dig += ch
+            else: break
+        nums.append(int(dig) if dig else 0)
+    return tuple(nums)
+
+_elegidas = {}
+for _whl in glob.glob("build/wheels/*.whl"):
+    _dist, _ver = _rueda_info(os.path.basename(_whl))
+    if _dist not in _elegidas or _version_tupla(_ver) > _version_tupla(_rueda_info(os.path.basename(_elegidas[_dist]))[1]):
+        _elegidas[_dist] = _whl
+
+for whl in sorted(_elegidas.values()):
     nombre = os.path.basename(whl)
     if nombre.startswith("opencv_python-"):
         continue
@@ -70,4 +95,28 @@ for dll in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "concrt140
 shutil.copy("app/aven_pdf.py", BASE + "/app/aven_pdf.py")
 shutil.copy("app/aven_ui.py", BASE + "/app/aven_ui.py")
 shutil.copy("app/aven.ico", BASE + "/app/aven.ico")
+
+# 5) Verificación DENTRO del paquete ya armado, con el Python del paquete:
+# Pillow debe importar y funcionar (su parte Python y su núcleo compilado
+# deben ser de la MISMA versión; mezclados, importar Image revienta) y
+# PyMuPDF debe abrir un documento. Si algo está roto, la compilación FALLA
+# aquí con un mensaje claro, en vez de entregar un instalador que falla en
+# silencio en la PC del usuario.
+import subprocess
+_exe = os.path.join(BASE, "python", "python.exe")
+if os.path.exists(_exe):
+    _pruebas = [
+        ("Pillow", "import os, tempfile, PIL; from PIL import Image; "
+                   "p = os.path.join(tempfile.gettempdir(), 'aven_pil_test.png'); "
+                   "Image.new('RGB', (8, 8), (255, 0, 0)).save(p); os.remove(p); "
+                   "print('Pillow OK', PIL.__version__)"),
+        ("PyMuPDF", "import pymupdf; d = pymupdf.open(); d.new_page(); "
+                    "print('PyMuPDF OK', getattr(pymupdf, '__version__', ''))"),
+    ]
+    for _nombre_p, _codigo in _pruebas:
+        _r = subprocess.run([_exe, "-c", _codigo], capture_output=True, text=True)
+        print((_r.stdout or "").strip())
+        if _r.returncode != 0:
+            print(_r.stderr)
+            raise SystemExit("ERROR: " + _nombre_p + " quedo roto en el paquete; compilacion detenida a proposito")
 print("payload listo:", count, "ruedas integradas")
