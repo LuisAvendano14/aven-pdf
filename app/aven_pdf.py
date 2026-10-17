@@ -793,7 +793,7 @@ if __name__ == "__main__":
         ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
     print(f"Aven PDF escuchando en http://127.0.0.1:{PORT}  (Ctrl+C para cerrar)")
     if "--ventana" in sys.argv:
-        import os as _os, traceback as _tb
+        import os as _os, traceback as _tb, subprocess as _sp
         _dir = _os.path.dirname(_os.path.abspath(__file__))
         def _log(msg):
             try:
@@ -804,20 +804,9 @@ if __name__ == "__main__":
         _log("=== inicio en modo ventana ===")
         threading.Thread(target=_serve, daemon=True).start()
         time.sleep(1.2)
-        try:
-            _log("importando pywebview...")
-            import webview
-            _log("pywebview importado; creando la ventana")
-            webview.create_window("Aven PDF", f"http://127.0.0.1:{PORT}",
-                                  width=1440, height=950, min_size=(1000, 700))
-            try:
-                webview.start(gui="edgechromium")
-            except TypeError:
-                webview.start()
-            _log("ventana cerrada normalmente")
-        except Exception:
-            _log("FALLO ventana propia:\n" + _tb.format_exc())
-            # Respaldo 1: Edge en modo aplicación (ventana propia, sin barra de direcciones)
+
+        def _respaldo_edge():
+            # Respaldo: Edge en modo aplicación (ventana sin barra de direcciones)
             _edge = None
             for _cand in (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                           r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"):
@@ -826,18 +815,68 @@ if __name__ == "__main__":
                     break
             if _edge:
                 try:
-                    import subprocess as _sp
                     _log("respaldo: Edge en modo app -> " + _edge)
                     _sp.Popen([_edge, f"--app=http://127.0.0.1:{PORT}", "--window-size=1440,950"])
                     while True: time.sleep(3600)
                 except Exception:
                     _log("FALLO respaldo Edge app:\n" + _tb.format_exc())
-            # Respaldo 2: navegador normal
             import webbrowser
             webbrowser.open(f"http://127.0.0.1:{PORT}")
             try:
                 while True: time.sleep(3600)
             except KeyboardInterrupt:
                 pass
+
+        # La ventana corre en un PROCESO HIJO: si la ventana propia se
+        # estrella a nivel nativo (sin traceback posible, como pasaba en
+        # algunas PC), el servidor sobrevive y entra el respaldo en vez
+        # de que no abra nada.
+        _hijo = _sp.Popen([sys.executable, _os.path.abspath(__file__), "--solo-ventana"])
+        _t0 = time.time()
+        _murio = False
+        while time.time() - _t0 < 6:
+            if _hijo.poll() is not None:
+                _murio = True
+                break
+            time.sleep(0.3)
+        if _murio:
+            _log("la ventana propia se cerro al arrancar (codigo %s); va el respaldo" % _hijo.returncode)
+            _respaldo_edge()
+        else:
+            _log("ventana propia en marcha")
+            try:
+                _hijo.wait()
+            except KeyboardInterrupt:
+                pass
+            _log("ventana cerrada; fin del programa")
+    elif "--solo-ventana" in sys.argv:
+        # Proceso hijo: solo abre la ventana nativa contra el servidor del padre.
+        import os as _os, traceback as _tb
+        _dir = _os.path.dirname(_os.path.abspath(__file__))
+        def _log(msg):
+            try:
+                with open(_os.path.join(_dir, "aven_ventana.log"), "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+        try:
+            import faulthandler as _fh
+            _fh.enable(file=open(_os.path.join(_dir, "aven_ventana.log"), "a", encoding="utf-8"), all_threads=True)
+        except Exception:
+            pass
+        try:
+            _log("importando pywebview...")
+            import webview
+            _log("pywebview importado; creando la ventana")
+            webview.create_window("Aven PDF", "http://127.0.0.1:8890",
+                                  width=1440, height=950, min_size=(1000, 700))
+            try:
+                webview.start(gui="edgechromium")
+            except TypeError:
+                webview.start()
+            _log("ventana cerrada normalmente")
+        except Exception:
+            _log("FALLO ventana propia:\n" + _tb.format_exc())
+            raise
     else:
         _serve()
