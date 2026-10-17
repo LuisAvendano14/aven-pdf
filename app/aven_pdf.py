@@ -46,19 +46,61 @@ def api_info(d):
             "title": md.get("title") or "", "author": md.get("author") or "",
             "creator": md.get("creator") or "", "producer": md.get("producer") or "",
             "size_kb": round(len(data) / 1024, 1),
-            "page_sizes": [[round(p.rect.width), round(p.rect.height)] for p in doc][:50],
+            "page_sizes": [[round(p.rect.width), round(p.rect.height)] for p in doc],
             "bookmarks": len(doc.get_toc()),
             "toc": [[lv, t, pg] for (lv, t, pg) in doc.get_toc()]}
 
+
+# ===== Almacén de documentos (1.7): el cliente sube el PDF una sola vez y
+# después todo viaja con un doc_id corto. Sin esto, CADA página dibujada
+# volvía a subir el archivo entero (un PDF de 31 MB = minutos por cambio).
+import threading, uuid
+from collections import OrderedDict
+DOCS = OrderedDict()
+DOCS_LOCK = threading.Lock()
+DOCS_MAX_BYTES = 600 * 1024 * 1024
+
+def store_doc(data):
+    did = uuid.uuid4().hex[:12]
+    with DOCS_LOCK:
+        DOCS[did] = data
+        total = sum(len(v) for v in DOCS.values())
+        while (total > DOCS_MAX_BYTES or len(DOCS) > 40) and len(DOCS) > 1:
+            _, old = DOCS.popitem(last=False)
+            total -= len(old)
+    return did
+
+RENDER_CACHE = OrderedDict()
+RENDER_CACHE_MAX = 240
+
+def api_open(d):
+    """Registra el PDF en el almacén y devuelve su info + doc_id."""
+    data = b64d(d["pdf"])
+    info = api_info(d)
+    info["doc_id"] = store_doc(data)
+    return info
+
 def api_render(d):
+    _ckey = None
+    if d.get("doc_id"):
+        _ckey = (d["doc_id"], int(d.get("page", 0)),
+                 round(float(d.get("zoom", 1.4)), 3), d.get("password") or "")
+        if _ckey in RENDER_CACHE:
+            RENDER_CACHE.move_to_end(_ckey)
+            return dict(RENDER_CACHE[_ckey])
     doc = pymupdf.open(stream=b64d(d["pdf"]), filetype="pdf")
     if doc.is_encrypted and not doc.authenticate(d.get("password") or ""):
         raise ValueError("El PDF está protegido: escribe su contraseña en Acceso (pestaña Archivo)")
     page = doc[int(d.get("page", 0))]
     zoom = float(d.get("zoom", 1.4))
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
-    return {"png": b64e(pix.tobytes("png")), "pages": doc.page_count,
-            "w": pix.width, "h": pix.height}
+    out = {"png": b64e(pix.tobytes("png")), "pages": doc.page_count,
+           "w": pix.width, "h": pix.height}
+    if _ckey:
+        RENDER_CACHE[_ckey] = out
+        while len(RENDER_CACHE) > RENDER_CACHE_MAX:
+            RENDER_CACHE.popitem(last=False)
+    return out
 
 def api_merge(d):
     w = PdfWriter()
@@ -243,8 +285,45 @@ def api_decrypt(d):
 def api_compress(d):
     data = b64d(d["pdf"])
     doc = pymupdf.open(stream=data, filetype="pdf")
-    out = doc.tobytes(garbage=4, deflate=True, deflate_images=True, deflate_fonts=True)
-    return {"pdf": b64e(out), "pages": doc.page_count,
+    if doc.needs_pass and doc.authenticate(d.get("password") or "") <= 0:
+        raise ValueError("El PDF tiene contraseña: ábrelo primero con su contraseña.")
+    dpi, calidad = {"pantalla": (150, 58), "media": (200, 74),
+                    "alta": (300, 88)}.get(d.get("level"), (200, 74))
+    # Ancho en pixeles que necesita cada imagen según el tamaño al que se
+    # muestra en su página (una foto gigante mostrada chica sobra en pixeles).
+    need = {}
+    for page in doc:
+        for img in page.get_images(full=True):
+            xref = img[0]
+            for r in page.get_image_rects(xref):
+                px = r.width / 72.0 * dpi
+                if px > need.get(xref, 0): need[xref] = px
+    from PIL import Image
+    hechas = 0
+    for xref, needpx in need.items():
+        try:
+            pix = pymupdf.Pixmap(doc, xref)
+            if pix.width <= needpx * 1.05: continue      # ya es chica: no tocar
+            if pix.alpha: pix = pymupdf.Pixmap(pix, 0)
+            if pix.n >= 4: pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            if pix.n not in (1, 3): continue
+            im = Image.frombytes("RGB" if pix.n == 3 else "L",
+                                 (pix.width, pix.height), pix.samples)
+            nw = max(1, round(needpx)); nh = max(1, round(pix.height * needpx / pix.width))
+            im = im.resize((nw, nh), Image.LANCZOS)
+            buf = io.BytesIO(); im.save(buf, "JPEG", quality=calidad)
+            nuevo = buf.getvalue()
+            for page in doc:
+                if any(i2[0] == xref for i2 in page.get_images(full=True)):
+                    page.replace_image(xref, stream=nuevo)
+            hechas += 1
+            del pix, im, nuevo
+            if hechas % 20 == 0:
+                import gc; gc.collect()
+        except Exception:
+            continue
+    out = doc.tobytes(garbage=4, deflate=True)
+    return {"pdf": b64e(out), "pages": doc.page_count, "images_done": hechas,
             "before_kb": round(len(data) / 1024, 1), "after_kb": round(len(out) / 1024, 1)}
 
 def api_to_images(d):
@@ -646,7 +725,7 @@ def api_deskew(d):
         npg.insert_image(npg.rect, stream=buf.getvalue())
     return {"pdf": b64e(out.tobytes(garbage=3, deflate=True)), "fixed": fixed, "pages": out.page_count}
 
-APIS = {"/api/info": api_info, "/api/render": api_render, "/api/merge": api_merge,
+APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render, "/api/merge": api_merge,
         "/api/insert_pdf": api_insert_pdf, "/api/reorder": api_reorder,
         "/api/to_word": api_to_word, "/api/to_excel": api_to_excel,
         "/api/ocr_text": api_ocr_text, "/api/ocr_pdf": api_ocr_pdf,
@@ -687,7 +766,17 @@ class H(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", 0))
             d = json.loads(self.rfile.read(n) or b"{}")
+            if d.get("doc_id"):
+                with DOCS_LOCK:
+                    _data = DOCS.get(d["doc_id"])
+                    if _data is not None: DOCS.move_to_end(d["doc_id"])
+                if _data is None:
+                    raise ValueError("El documento ya no está en la memoria del programa (se abrieron otros después). Vuelve a abrir el PDF.")
+                d["pdf"] = b64e(_data)
             out = fn(d); code = 200
+            if isinstance(out, dict) and isinstance(out.get("pdf"), str):
+                try: out["doc_id"] = store_doc(b64d(out["pdf"]))
+                except Exception: pass
         except Exception as e:
             out = {"error": str(e)}; code = 400
         body = json.dumps(out).encode("utf-8")
