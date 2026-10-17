@@ -1,0 +1,44 @@
+name: Construir instalador Aven PDF
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Bajar el codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Descargar el Python incrustado oficial (python.org)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.13.7/python-3.13.7-embed-amd64.zip" -OutFile "build/python-embed.zip"
+          Get-Item build/python-embed.zip
+
+      - name: Descargar las librerias (versiones de Windows)
+        shell: pwsh
+        run: |
+          python -m pip download -d build/wheels pypdf pymupdf cryptography pdf2docx endesive pdfplumber openpyxl rapidocr-onnxruntime pywebview
+          python -m pip download -d build/wheels --no-deps pythonnet clr_loader bottle proxy-tools
+
+      - name: Armar el paquete del programa (payload)
+        run: python assemble_win.py
+
+      - name: Instalar Inno Setup (el compilador de instaladores)
+        run: choco install innosetup -y --no-progress
+
+      - name: Compilar el instalador en espanol
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          Get-Item out/AvenPDF_Setup.exe
+
+      - name: Subir el instalador terminado
+        uses: actions/upload-artifact@v4
+        with:
+          name: AvenPDF_Setup
+          path: out/AvenPDF_Setup.exe
