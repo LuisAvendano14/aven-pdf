@@ -27,6 +27,8 @@ def parse_pages(spec, total):
             a, b = part.split("-", 1)
             try: rng = range(int(a), int(b) + 1)
             except ValueError: raise ValueError("Páginas no válidas: usa números y rangos como 1-3,5")
+            if int(b) < int(a):
+                raise ValueError("Rango invertido: " + part + " (la página final no puede ser menor que la inicial)")
         else:
             try: rng = [int(part)]
             except ValueError: raise ValueError("Páginas no válidas: usa números y rangos como 1-3,5")
@@ -91,7 +93,10 @@ def api_render(d):
     doc = pymupdf.open(stream=b64d(d["pdf"]), filetype="pdf")
     if doc.is_encrypted and not doc.authenticate(d.get("password") or ""):
         raise ValueError("El PDF está protegido: escribe su contraseña en Acceso (pestaña Archivo)")
-    page = doc[int(d.get("page", 0))]
+    _pno = int(d.get("page", 0))
+    if not 0 <= _pno < doc.page_count:
+        raise ValueError("La página %d no existe: el documento tiene %d páginas" % (_pno + 1, doc.page_count))
+    page = doc[_pno]
     zoom = float(d.get("zoom", 1.4))
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
     out = {"png": b64e(pix.tobytes("png")), "pages": doc.page_count,
@@ -266,6 +271,8 @@ def api_stamp(d):
     return {"pdf": b64e(doc.tobytes(garbage=3, deflate=True)), "pages": doc.page_count}
 
 def api_encrypt(d):
+    if not (d.get("password") or ""):
+        raise ValueError("Escribe la contraseña nueva para proteger el PDF")
     r = PdfReader(io.BytesIO(b64d(d["pdf"])))
     w = PdfWriter()
     for p in r.pages: w.add_page(p)
@@ -520,7 +527,8 @@ def _fontname(span_font):
 def api_text_at(d):
     """Devuelve la linea de texto bajo el punto (fx, fy relativos 0..1)."""
     doc = pymupdf.open(stream=b64d(d["pdf"]), filetype="pdf")
-    if d.get("password"): doc.authenticate(d["password"])
+    if d.get("password") and doc.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
     page = doc[int(d.get("page", 0))]
     W, H = page.rect.width, page.rect.height
     pt = pymupdf.Point(float(d["fx"]) * W, float(d["fy"]) * H)
@@ -553,7 +561,8 @@ def api_text_at(d):
 def api_edit_line(d):
     """Reemplaza UNA linea: borra la original (sin tocar bordes ni imagenes) y escribe la nueva en su sitio."""
     doc = pymupdf.open(stream=b64d(d["pdf"]), filetype="pdf")
-    if d.get("password"): doc.authenticate(d["password"])
+    if d.get("password") and doc.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
     page = doc[int(d.get("page", 0))]
     b = [float(v) for v in d["bbox"]]
     page.add_redact_annot(pymupdf.Rect(b[0] - 1, b[1] - 0.5, b[2] + 1, b[3] + 0.5))
@@ -712,14 +721,20 @@ def api_deskew(d):
     idx = set(parse_pages(d.get("pages", ""), doc.page_count) or list(range(doc.page_count)))
     out = pymupdf.open(); fixed = 0
     for i, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.2, 2.2))
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        ang = 0.0
         if i in idx:
-            small = img.convert("L"); small.thumbnail((700, 990))
+            pix0 = page.get_pixmap(matrix=pymupdf.Matrix(2.2, 2.2))
+            img0 = Image.frombytes("RGB", (pix0.width, pix0.height), pix0.samples)
+            small = img0.convert("L"); small.thumbnail((700, 990))
             ang = _skew_angle(small)
-            if abs(ang) >= 0.3:
-                img = img.rotate(ang, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
-                fixed += 1
+        if i not in idx or abs(ang) < 0.3:
+            # Página no tocada o ya derecha: se copia TAL CUAL (conserva su
+            # texto buscable); antes TODO el documento salía convertido en
+            # imagen aunque solo se corrigieran unas páginas.
+            out.insert_pdf(doc, from_page=i, to_page=i)
+            continue
+        img = img0.rotate(ang, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
+        fixed += 1
         buf = io.BytesIO(); img.save(buf, "JPEG", quality=80)
         npg = out.new_page(width=page.rect.width, height=page.rect.height)
         npg.insert_image(npg.rect, stream=buf.getvalue())
