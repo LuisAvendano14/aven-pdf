@@ -138,6 +138,8 @@ if os.path.exists(_exe):
                     "print('PyMuPDF OK', getattr(pymupdf, '__version__', ''))"),
         ("onnxruntime", "import onnxruntime; "
                         "print('onnxruntime OK', onnxruntime.__version__)"),
+        ("pywebview", "import webview, proxy_tools; "
+                      "print('pywebview OK')"),
     ]
     for _nombre_p, _codigo in _pruebas:
         _r = subprocess.run([_exe, "-c", _codigo], capture_output=True, text=True)
