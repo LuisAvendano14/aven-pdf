@@ -3,14 +3,15 @@
 [Setup]
 AppId={{B7A51C2E-3D4F-4E5A-9B6C-1A2B3C4D5E6F}
 AppName=Aven PDF
-AppVersion=1.7.3
+AppVersion=1.8
+AppMutex=AvenPDFVentana
 AppPublisher=Aven
 DefaultDirName={localappdata}\AvenPDF
 DefaultGroupName=Aven PDF
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=out
-OutputBaseFilename=AvenPDF_Setup
+OutputBaseFilename=AvenPDF_Setup_1.8
 SetupIconFile=app\aven.ico
 UninstallDisplayIcon={app}\app\aven.ico
 Compression=lzma2/max
