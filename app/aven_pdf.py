@@ -787,25 +787,38 @@ def api_to_scanned(d):
     return {"pdf": b64e(out.tobytes(garbage=3, deflate=True)), "pages": out.page_count}
 
 def _skew_angle(imgL):
-    """Angulo de inclinacion (grados) de una pagina en gris, por proyeccion de filas."""
+    """Ángulo de inclinación (grados) de una página en gris: proyección de
+    filas con criterio de energía (suma de cuadrados), que da un pico
+    mucho más nítido que la varianza; dos pasadas (gruesa y fina)."""
     import numpy as np
     from PIL import Image
     a = np.asarray(imgL, dtype=np.uint8)
-    if (a < 128).sum() < 60: return 0.0
+    h, w = a.shape
+    a = a[int(h * 0.04):int(h * 0.96), int(w * 0.03):int(w * 0.97)]
+    if (a < 160).sum() < 80: return 0.0
+    base = Image.fromarray(a)
+    def score(ang):
+        r = base.rotate(ang, resample=Image.BILINEAR, fillcolor=255)
+        rows = (np.asarray(r, dtype=np.float32) < 160).sum(axis=1)
+        return float((rows * rows).sum())
     best, bestv = 0.0, -1.0
-    for k in range(-20, 21):
-        ang = k * 0.25
-        r = Image.fromarray(a).rotate(ang, resample=Image.BILINEAR, fillcolor=255)
-        v = float((np.asarray(r, dtype=np.float32) < 128).sum(axis=1).var())
-        if v > bestv: bestv, best = v, ang
+    k = -6.0
+    while k <= 6.01:
+        v = score(k)
+        if v > bestv: bestv, best = v, k
+        k += 0.5
+    k = best - 0.6
+    while k <= best + 0.601:
+        kk = round(k, 2)
+        v = score(kk)
+        if v > bestv: bestv, best = v, kk
+        k += 0.1
     return best
 
 def api_deskew(d):
     """Endereza paginas chuecas: detecta el angulo y lo corrige (salida en imagen)."""
     from PIL import Image
-    doc = pymupdf.open(stream=P(d), filetype="pdf")
-    if doc.needs_pass and doc.authenticate(d.get("password", "")) <= 0:
-        raise ValueError("El PDF tiene contraseña: escríbela en el campo de Acceso (pestaña Archivo) y vuelve a intentarlo.")
+    doc = _open_tol(d)
     idx = set(parse_pages(d.get("pages", ""), doc.page_count) or list(range(doc.page_count)))
     out = pymupdf.open(); fixed = 0
     for i, page in enumerate(doc):
@@ -813,10 +826,10 @@ def api_deskew(d):
         if i in idx:
             pix0 = page.get_pixmap(matrix=pymupdf.Matrix(2.2, 2.2))
             img0 = Image.frombytes("RGB", (pix0.width, pix0.height), pix0.samples)
-            small = img0.convert("L"); small.thumbnail((700, 990))
+            small = img0.convert("L"); small.thumbnail((850, 1200))
             ang = _skew_angle(small)
         if d.get("_prog"): d["_prog"]((i + 1) * 100 // doc.page_count)
-        if i not in idx or abs(ang) < 0.3:
+        if i not in idx or abs(ang) < 0.12:
             # Página no tocada o ya derecha: se copia TAL CUAL (conserva su
             # texto buscable); antes TODO el documento salía convertido en
             # imagen aunque solo se corrigieran unas páginas.
@@ -860,6 +873,21 @@ def api_stage_download(d):
         for _k in [k for k, v in DL_STAGE.items() if time.time() - v[3] > 900]:
             DL_STAGE.pop(_k, None)
     return {"url": "/dl/" + tok}
+
+_T0 = time.time()
+
+def api_winmode(d):
+    import sys as _s
+    if "--ventana" not in _s.argv:
+        return {"mode": "navegador"}
+    try:
+        import os as _o
+        okf = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)), "aven_ventana.ok")
+        if _o.path.exists(okf) and _o.path.getmtime(okf) > _T0 - 120:
+            return {"mode": "nativa"}
+    except Exception:
+        pass
+    return {"mode": "respaldo Edge"}
 
 def api_job_start(d):
     op = d.get("op") or ""
@@ -943,7 +971,7 @@ APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render,
         "/api/form_fields": api_form_fields, "/api/fill_form": api_fill_form, "/api/extract_images": api_extract_images,
         "/api/to_scanned": api_to_scanned, "/api/deskew": api_deskew,
         "/api/fetch_doc": api_fetch_doc,
-        "/api/stage_download": api_stage_download,
+        "/api/stage_download": api_stage_download, "/api/winmode": api_winmode,
         "/api/job_start": api_job_start, "/api/job_status": api_job_status,
         "/api/job_cancel": api_job_cancel}
 
