@@ -50,7 +50,7 @@ def api_info(d):
     try: doc = pymupdf.open(stream=data, filetype="pdf")
     except Exception: raise ValueError("El archivo no es un PDF válido o está dañado")
     if doc.is_encrypted and not doc.authenticate(d.get("password") or ""):
-        raise ValueError("El PDF está protegido con contraseña: escríbela en el campo de Acceso (pestaña Archivo) y vuelve a abrirlo")
+        raise ValueError("El PDF está protegido con contraseña: se te pedirá en una ventana al abrirlo")
     md = doc.metadata or {}
     return {"pages": doc.page_count, "encrypted": doc.is_encrypted,
             "title": md.get("title") or "", "author": md.get("author") or "",
@@ -316,13 +316,8 @@ def api_encrypt(d):
     return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
 
 def api_decrypt(d):
-    try:
-        r = PdfReader(io.BytesIO(P(d)), password=d.get("password") or None)
-        w = PdfWriter()
-        for p in r.pages: w.add_page(p)
-    except Exception: raise ValueError("Contraseña incorrecta: no se pudo abrir el PDF")
-    buf = io.BytesIO(); w.write(buf)
-    return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
+    doc = _open_tol(d)
+    return {"pdf": b64e(doc.tobytes(garbage=3, deflate=True)), "pages": doc.page_count}
 
 def api_compress(d):
     data = P(d)
@@ -723,50 +718,70 @@ def api_extract_images(d):
     return {"zip": b64e(buf.getvalue()), "count": n, "pages": len(idx)}
 
 def api_to_scanned(d):
-    """Convierte el PDF en otro que PARECE escaneado de verdad: cada hoja
-    sale levemente girada (como al ponerla en el escáner), con la luz
-    ligeramente desigual, el ruido fino del sensor y el borde del papel.
-    No es un simple desenfoque: el texto se sigue leyendo perfecto."""
+    """Convierte el PDF en otro que PARECE salido de un escáner o una
+    fotocopiadora real: la hoja entra levemente girada sobre el cristal,
+    con su borde y su sombra, luz desigual con viñeta, textura y desgaste
+    del papel, motas de polvo y el grano del sensor. El texto NO se
+    desenfoca: se sigue leyendo perfecto."""
     import random
     import numpy as np
-    from PIL import Image, ImageEnhance, ImageFilter
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
     doc = _open_tol(d)
     mode = d.get("mode", "color")
     out = pymupdf.open()
     rnd = random.Random(20261017)
     for _pi, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.5, 2.5))
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.35, 2.35))
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         w, h = img.size
-        # 1) la hoja nunca entra derecha del todo al escáner
-        ang = rnd.uniform(0.35, 1.0) * rnd.choice((-1, 1))
-        img = img.rotate(ang, resample=Image.BICUBIC, expand=False,
-                         fillcolor=(252, 252, 250))
+        rng = np.random.default_rng(rnd.randrange(1 << 30))
         a = np.asarray(img).astype(np.float32)
-        # 2) luz del escáner: un lado un poco más luminoso que el otro,
-        #    con una caída suave hacia una esquina (aleatoria por hoja)
-        gx = np.linspace(rnd.uniform(0.965, 0.99), 1.0, w, dtype=np.float32)[None, :, None]
-        gy = np.linspace(1.0, rnd.uniform(0.975, 0.995), h, dtype=np.float32)[:, None, None]
-        a = a * gx * gy
-        # 3) el papel no es blanco perfecto: tinte apenas cálido y parejo
-        a = np.clip(a * np.array([1.012, 1.0, 0.982], dtype=np.float32), 0, 255)
-        # 4) ruido fino del sensor (más visible en las zonas blancas)
-        ruido = np.random.default_rng(rnd.randrange(1 << 30)).normal(0, 3.2, a.shape[:2])[..., None]
-        a = np.clip(a + ruido, 0, 255)
+        gx = np.linspace(rnd.uniform(0.96, 0.99), 1.0, w, dtype=np.float32)[None, :, None]
+        gy = np.linspace(1.0, rnd.uniform(0.97, 0.995), h, dtype=np.float32)[:, None, None]
+        yy, xx = np.mgrid[0:h, 0:w]
+        vig = 1 - 0.028 * (((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2)
+        a = a * gx * gy * vig[..., None].astype(np.float32)
+        a = np.clip(a * np.array([rnd.uniform(1.005, 1.02), 1.0, rnd.uniform(0.972, 0.99)], dtype=np.float32), 0, 255)
+        mot = rng.normal(0, 1, (h // 46 + 2, w // 46 + 2)).astype(np.float32)
+        mot = (mot - mot.min()) / (np.ptp(mot) + 1e-6)
+        mot = np.asarray(Image.fromarray((mot * 255).astype(np.uint8)).resize((w, h), Image.BICUBIC), dtype=np.float32) / 255.0
+        a = np.clip(a * (0.965 + 0.07 * mot[..., None]), 0, 255)
+        a = np.clip(a + rng.normal(0, 3.1, a.shape[:2])[..., None].astype(np.float32), 0, 255)
         img = Image.fromarray(a.astype(np.uint8))
-        # 5) el enfoque típico del escáner: una pizca de suavidad y luego
-        #    nitidez, con el contraste propio de una copia escaneada
+        dr = ImageDraw.Draw(img, "RGBA")
+        for _ in range(rnd.randrange(6, 26)):
+            x0, y0 = rnd.uniform(0, w), rnd.uniform(0, h)
+            r0 = rnd.uniform(0.6, 2.2)
+            dr.ellipse((x0 - r0, y0 - r0, x0 + r0, y0 + r0), fill=(60, 55, 45, rnd.randrange(28, 70)))
         img = img.filter(ImageFilter.GaussianBlur(0.35))
         img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=68, threshold=2))
         if mode == "bw":
             img = img.convert("L")
             img = ImageEnhance.Contrast(img).enhance(1.22)
             img = ImageEnhance.Brightness(img).enhance(1.03)
+            img = img.convert("RGB")
         else:
             img = ImageEnhance.Color(img).enhance(0.86)
             img = ImageEnhance.Contrast(img).enhance(1.06)
-        buf = io.BytesIO(); img.save(buf, "JPEG", quality=80)
-        npg = out.new_page(width=page.rect.width, height=page.rect.height)
+        mx, my = int(w * 0.035), int(h * 0.03)
+        bed = Image.new("RGB", (w + 2 * mx, h + 2 * my), (214, 214, 210))
+        ba = np.asarray(bed).astype(np.float32)
+        ba = np.clip(ba + rng.normal(0, 2.0, ba.shape[:2])[..., None].astype(np.float32), 0, 255)
+        bed = Image.fromarray(ba.astype(np.uint8))
+        sh = Image.new("RGB", bed.size, (214, 214, 210))
+        shd = ImageDraw.Draw(sh)
+        ox, oy = rnd.choice((-1, 1)) * int(w * 0.008), int(h * 0.01)
+        shd.rectangle((mx + ox, my + oy, mx + w + ox, my + h + oy), fill=(118, 118, 114))
+        sh = sh.filter(ImageFilter.GaussianBlur(12))
+        bed = Image.blend(bed, sh, 0.35)
+        ang = rnd.uniform(0.3, 0.9) * rnd.choice((-1, 1))
+        sheet = img.rotate(ang, resample=Image.BICUBIC, expand=False, fillcolor=(250, 250, 247))
+        bed.paste(sheet, (mx, my))
+        bd = ImageDraw.Draw(bed)
+        bd.rectangle((mx, my, mx + w - 1, my + h - 1), outline=(168, 166, 160), width=2)
+        buf = io.BytesIO(); bed.save(buf, "JPEG", quality=80)
+        npg = out.new_page(width=page.rect.width * (w + 2 * mx) / w,
+                           height=page.rect.height * (h + 2 * my) / h)
         npg.insert_image(npg.rect, stream=buf.getvalue())
         if d.get("_prog"): d["_prog"]((_pi + 1) * 100 // doc.page_count)
     return {"pdf": b64e(out.tobytes(garbage=3, deflate=True)), "pages": out.page_count}
@@ -831,6 +846,20 @@ def _job_cb(jid):
                 raise RuntimeError("Cancelado por el usuario")
             j["pct"] = max(0, min(99, int(pct))); j["known"] = True
     return cb
+
+DL_STAGE = {}
+DL_LOCK = threading.Lock()
+
+def api_stage_download(d):
+    data = b64d(d.get("data") or "")
+    if not data: raise ValueError("Nada para descargar")
+    tok = uuid.uuid4().hex[:16]
+    with DL_LOCK:
+        DL_STAGE[tok] = (data, d.get("name") or "archivo.pdf",
+                         d.get("mime") or "application/pdf", time.time())
+        for _k in [k for k, v in DL_STAGE.items() if time.time() - v[3] > 900]:
+            DL_STAGE.pop(_k, None)
+    return {"url": "/dl/" + tok}
 
 def api_job_start(d):
     op = d.get("op") or ""
@@ -914,6 +943,7 @@ APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render,
         "/api/form_fields": api_form_fields, "/api/fill_form": api_fill_form, "/api/extract_images": api_extract_images,
         "/api/to_scanned": api_to_scanned, "/api/deskew": api_deskew,
         "/api/fetch_doc": api_fetch_doc,
+        "/api/stage_download": api_stage_download,
         "/api/job_start": api_job_start, "/api/job_status": api_job_status,
         "/api/job_cancel": api_job_cancel}
 
@@ -922,6 +952,19 @@ from aven_ui import UI
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
+        if self.path.startswith("/dl/"):
+            from urllib.parse import quote as _q
+            tok = self.path[4:].split("?")[0]
+            with DL_LOCK: ent = DL_STAGE.pop(tok, None)
+            if ent is None:
+                self.send_response(404); self.end_headers(); return
+            data, name, mime, _t = ent
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + _q(name))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers(); self.wfile.write(data)
+            return
         if self.path in ("/", "/index.html"):
             body = UI.encode("utf-8")
             self.send_response(200)

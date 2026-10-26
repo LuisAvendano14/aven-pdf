@@ -3,8 +3,9 @@
 [Setup]
 AppId={{B7A51C2E-3D4F-4E5A-9B6C-1A2B3C4D5E6F}
 AppName=Aven PDF
-AppVersion=1.9
-AppMutex=AvenPDFVentana
+AppVersion=1.10
+CloseApplications=yes
+RestartApplications=no
 AppPublisher=Aven
 DefaultDirName={localappdata}\AvenPDF
 DefaultGroupName=Aven PDF

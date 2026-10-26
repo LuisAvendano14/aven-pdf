@@ -122,6 +122,15 @@ for dll in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "concrt140
         if os.path.isdir(capi):
             shutil.copy(src, os.path.join(capi, dll))
 
+# 3b) Recorte seguro: fuera suites de pruebas y cachés de compilación
+#     (numpy/PIL/etc. traen decenas de MB que el programa nunca usa).
+import os as _os
+for _raiz, _dirs, _archs in _os.walk(SP):
+    for _d in list(_dirs):
+        if _d == "__pycache__" or (_d in ("tests", "test") and _os.path.abspath(_raiz) != _os.path.abspath(SP)):
+            shutil.rmtree(_os.path.join(_raiz, _d), ignore_errors=True)
+            _dirs.remove(_d)
+
 # 4) La aplicacion
 shutil.copy("app/aven_pdf.py", BASE + "/app/aven_pdf.py")
 shutil.copy("app/aven_ui.py", BASE + "/app/aven_ui.py")
