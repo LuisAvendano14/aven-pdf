@@ -135,9 +135,10 @@ def api_render(d):
 
 def api_merge(d):
     w = PdfWriter()
-    for item in d["pdfs"]:
+    for _k, item in enumerate(d["pdfs"], 1):
         r = PdfReader(io.BytesIO(b64d(item)))
         for p in r.pages: w.add_page(p)
+        if d.get("_prog"): d["_prog"](_k * 100 // max(1, len(d["pdfs"])))
     buf = io.BytesIO(); w.write(buf)
     return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
 
@@ -183,39 +184,45 @@ def api_split(d):
             parts.append((nm, g))
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-        for nm, idx in parts:
+        for _k, (nm, idx) in enumerate(parts, 1):
             w = PdfWriter()
             for i in idx: w.add_page(r.pages[i])
             b = io.BytesIO(); w.write(b)
             z.writestr(nm, b.getvalue())
+            if d.get("_prog"): d["_prog"](_k * 100 // max(1, len(parts)))
     return {"zip": b64e(zbuf.getvalue()), "parts": len(parts)}
 
+def _open_tol(d):
+    """Abre el PDF y lo autentica con la contraseña del pedido. Si sigue
+    protegido, el error sale en español claro (antes pymupdf soltaba
+    «File has not been decrypted» en inglés)."""
+    doc = pymupdf.open(stream=P(d), filetype="pdf")
+    if doc.needs_pass and doc.authenticate(d.get("password", "")) <= 0:
+        raise ValueError("El PDF está protegido con contraseña: escríbela en el campo de Acceso (pestaña Archivo) y vuelve a intentarlo.")
+    return doc
+
 def api_rotate(d):
-    r = PdfReader(io.BytesIO(P(d)))
-    idx = parse_pages(d.get("pages", ""), len(r.pages)) or list(range(len(r.pages)))
+    # Con pymupdf (motor nativo): en archivos pesados tarda una fracción
+    # de lo que tardaba pypdf reescribiendo el documento en Python puro.
+    doc = _open_tol(d)
+    idx = parse_pages(d.get("pages", ""), doc.page_count) or list(range(doc.page_count))
     deg = int(d.get("degrees", 90))
-    w = PdfWriter()
-    for i, p in enumerate(r.pages):
-        if i in idx: p.rotate(deg)
-        w.add_page(p)
-    buf = io.BytesIO(); w.write(buf)
-    return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
+    for i in idx:
+        doc[i].set_rotation((doc[i].rotation + deg) % 360)
+    return {"pdf": b64e(doc.tobytes()), "pages": doc.page_count}
 
 def api_delete_pages(d):
-    r = PdfReader(io.BytesIO(P(d)))
-    drop = set(parse_pages(d.get("pages", ""), len(r.pages)))
+    doc = _open_tol(d)
+    drop = set(parse_pages(d.get("pages", ""), doc.page_count))
     if not drop: raise ValueError("Indica qué páginas borrar")
-    if len(drop) >= len(r.pages): raise ValueError("No puedes borrar todas las páginas")
-    w = PdfWriter()
-    for i, p in enumerate(r.pages):
-        if i not in drop: w.add_page(p)
-    buf = io.BytesIO(); w.write(buf)
-    return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
+    if len(drop) >= doc.page_count: raise ValueError("No puedes borrar todas las páginas")
+    doc.select([i for i in range(doc.page_count) if i not in drop])
+    return {"pdf": b64e(doc.tobytes()), "pages": doc.page_count}
 
 def api_watermark(d):
     doc = pymupdf.open(stream=P(d), filetype="pdf")
     text = d.get("text") or "Aven PDF"
-    for page in doc:
+    for _pi, page in enumerate(doc):
         r = page.rect
         fs = max(28, r.width / max(6, len(text)) * 1.1)
         op = float(d.get("opacity", 0.25))
@@ -224,6 +231,7 @@ def api_watermark(d):
                          fontsize=fs, fontname="helv", color=(0.55, 0.6, 0.7),
                          fill_opacity=op, stroke_opacity=op,
                          morph=(pt, pymupdf.Matrix(35)))
+        if d.get("_prog"): d["_prog"]((_pi + 1) * 100 // max(1, doc.page_count))
     return {"pdf": b64e(doc.tobytes(garbage=3, deflate=True)), "pages": doc.page_count}
 
 def api_add_text(d):
@@ -265,7 +273,7 @@ def api_watermark_image(d):
         pix.set_alpha(bytes(int(b * op) for b in plane))
         img = pix.tobytes("png")
     wpct = float(d.get("width_pct", 55))
-    for page in doc:
+    for _pi, page in enumerate(doc):
         r = page.rect
         w = r.width * wpct / 100.0
         h = w * ih / float(iw)
@@ -276,6 +284,7 @@ def api_watermark_image(d):
                             (r.width + w) / 2.0, (r.height + h) / 2.0)
         page.insert_image(rect, stream=img, keep_proportion=False,
                           overlay=True)
+        if d.get("_prog"): d["_prog"]((_pi + 1) * 100 // max(1, doc.page_count))
     return {"pdf": b64e(doc.tobytes(garbage=3, deflate=True)), "pages": doc.page_count}
 
 def api_stamp(d):
@@ -379,15 +388,17 @@ def api_to_text(d):
     parts = []
     for i, page in enumerate(doc, 1):
         parts.append(f"===== Página {i} =====\n" + page.get_text())
+        if d.get("_prog"): d["_prog"](i * 100 // max(1, doc.page_count))
     return {"text": "\n\n".join(parts), "pages": doc.page_count}
 
 def api_images_to_pdf(d):
     doc = pymupdf.open()
-    for item in d["images"]:
+    for _k, item in enumerate(d["images"], 1):
         img = b64d(item)
         pix = pymupdf.Pixmap(img)
         page = doc.new_page(width=pix.width, height=pix.height)
         page.insert_image(pymupdf.Rect(0, 0, pix.width, pix.height), stream=img)
+        if d.get("_prog"): d["_prog"](_k * 100 // max(1, len(d["images"])))
     return {"pdf": b64e(doc.tobytes(garbage=3, deflate=True)), "pages": doc.page_count}
 
 def api_text_to_pdf(d):
@@ -712,29 +723,49 @@ def api_extract_images(d):
     return {"zip": b64e(buf.getvalue()), "count": n, "pages": len(idx)}
 
 def api_to_scanned(d):
-    """Convierte el PDF en otro que PARECE escaneado (lookscanned)."""
+    """Convierte el PDF en otro que PARECE escaneado de verdad: cada hoja
+    sale levemente girada (como al ponerla en el escáner), con la luz
+    ligeramente desigual, el ruido fino del sensor y el borde del papel.
+    No es un simple desenfoque: el texto se sigue leyendo perfecto."""
     import random
+    import numpy as np
     from PIL import Image, ImageEnhance, ImageFilter
-    doc = pymupdf.open(stream=P(d), filetype="pdf")
-    if doc.needs_pass and doc.authenticate(d.get("password", "")) <= 0:
-        raise ValueError("El PDF tiene contraseña: escríbela en el campo de Acceso (pestaña Archivo) y vuelve a intentarlo.")
+    doc = _open_tol(d)
     mode = d.get("mode", "color")
     out = pymupdf.open()
     rnd = random.Random(20261017)
     for _pi, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.2, 2.2))
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.5, 2.5))
         img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        img = img.rotate(rnd.uniform(-0.5, 0.5), resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
-        img = img.filter(ImageFilter.GaussianBlur(0.5))
+        w, h = img.size
+        # 1) la hoja nunca entra derecha del todo al escáner
+        ang = rnd.uniform(0.35, 1.0) * rnd.choice((-1, 1))
+        img = img.rotate(ang, resample=Image.BICUBIC, expand=False,
+                         fillcolor=(252, 252, 250))
+        a = np.asarray(img).astype(np.float32)
+        # 2) luz del escáner: un lado un poco más luminoso que el otro,
+        #    con una caída suave hacia una esquina (aleatoria por hoja)
+        gx = np.linspace(rnd.uniform(0.965, 0.99), 1.0, w, dtype=np.float32)[None, :, None]
+        gy = np.linspace(1.0, rnd.uniform(0.975, 0.995), h, dtype=np.float32)[:, None, None]
+        a = a * gx * gy
+        # 3) el papel no es blanco perfecto: tinte apenas cálido y parejo
+        a = np.clip(a * np.array([1.012, 1.0, 0.982], dtype=np.float32), 0, 255)
+        # 4) ruido fino del sensor (más visible en las zonas blancas)
+        ruido = np.random.default_rng(rnd.randrange(1 << 30)).normal(0, 3.2, a.shape[:2])[..., None]
+        a = np.clip(a + ruido, 0, 255)
+        img = Image.fromarray(a.astype(np.uint8))
+        # 5) el enfoque típico del escáner: una pizca de suavidad y luego
+        #    nitidez, con el contraste propio de una copia escaneada
+        img = img.filter(ImageFilter.GaussianBlur(0.35))
+        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=68, threshold=2))
         if mode == "bw":
             img = img.convert("L")
-            img = ImageEnhance.Contrast(img).enhance(1.25)
-            img = ImageEnhance.Brightness(img).enhance(1.04)
+            img = ImageEnhance.Contrast(img).enhance(1.22)
+            img = ImageEnhance.Brightness(img).enhance(1.03)
         else:
-            img = ImageEnhance.Color(img).enhance(0.8)
-            img = ImageEnhance.Contrast(img).enhance(1.05)
-            img = ImageEnhance.Brightness(img).enhance(1.02)
-        buf = io.BytesIO(); img.save(buf, "JPEG", quality=72)
+            img = ImageEnhance.Color(img).enhance(0.86)
+            img = ImageEnhance.Contrast(img).enhance(1.06)
+        buf = io.BytesIO(); img.save(buf, "JPEG", quality=80)
         npg = out.new_page(width=page.rect.width, height=page.rect.height)
         npg.insert_image(npg.rect, stream=buf.getvalue())
         if d.get("_prog"): d["_prog"]((_pi + 1) * 100 // doc.page_count)
@@ -798,7 +829,7 @@ def _job_cb(jid):
             if j is None: return
             if j.get("cancel"):
                 raise RuntimeError("Cancelado por el usuario")
-            j["pct"] = max(0, min(99, int(pct)))
+            j["pct"] = max(0, min(99, int(pct))); j["known"] = True
     return cb
 
 def api_job_start(d):
@@ -839,10 +870,10 @@ def api_job_status(d):
         if j is None:
             raise ValueError("Esa tarea ya no existe (el programa se reinició o la tarea expiró)")
         el = time.time() - j["t0"]; pct = j["pct"]
-        out = {"done": j["done"], "pct": pct, "elapsed": round(el),
+        out = {"done": j["done"], "pct": pct, "elapsed": round(el), "known": bool(j.get("known")),
                "eta": (round(el * (100 - pct) / pct) if (not j["done"] and pct > 0) else None)}
         if j["done"]:
-            if j.get("error"): out["error"] = j["error"]
+            if j.get("error"): out["error"] = _friendly_err(Exception(j["error"]))
             else: out["result"] = j["result"]
             JOBS.pop(d.get("job"), None)
     return out
@@ -852,6 +883,18 @@ def api_job_cancel(d):
         j = JOBS.get(d.get("job") or "")
         if j is not None: j["cancel"] = True
     return {"ok": True}
+
+def _friendly_err(e):
+    """Traduce los errores crudos de las librerías a español claro."""
+    m = str(e)
+    low = m.lower()
+    if ("decrypt" in low or "encrypted" in low or "invalid password" in low
+            or "password" in low and "contraseña" not in m):
+        return ("El PDF está protegido con contraseña: escríbela en el campo "
+                "de Acceso (pestaña Archivo) y vuelve a intentarlo.")
+    if "document closed" in low:
+        return "El documento se cerró inesperadamente; vuelve a abrir el PDF."
+    return m
 
 APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render, "/api/merge": api_merge,
         "/api/insert_pdf": api_insert_pdf, "/api/reorder": api_reorder,
@@ -908,8 +951,10 @@ class H(BaseHTTPRequestHandler):
             if self.path != "/api/fetch_doc" and isinstance(out, dict) and isinstance(out.get("pdf"), str):
                 try: out["doc_id"] = store_doc(b64d(out["pdf"]))
                 except Exception: pass
+            if d.get("light") and isinstance(out, dict) and out.get("doc_id") and isinstance(out.get("pdf"), str):
+                out = dict(out); out["pdf"] = None  # la interfaz lo adopta por doc_id
         except Exception as e:
-            out = {"error": str(e)}; code = 400
+            out = {"error": _friendly_err(e)}; code = 400
         body = json.dumps(out).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
