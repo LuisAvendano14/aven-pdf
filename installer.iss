@@ -3,7 +3,7 @@
 [Setup]
 AppId={{B7A51C2E-3D4F-4E5A-9B6C-1A2B3C4D5E6F}
 AppName=Aven PDF
-AppVersion=1.14
+AppVersion=1.15
 CloseApplications=yes
 RestartApplications=no
 AppPublisher=Aven

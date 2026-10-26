@@ -1086,22 +1086,30 @@ if __name__ == "__main__":
         # nativo que deja el proceso zombi, como pasaba en algunas PC),
         # el servidor sobrevive y entra el respaldo en vez de no abrir nada.
         _marca = _os.path.join(_dir, "aven_ventana.ok")
-        try: _os.remove(_marca)
-        except Exception: pass
-        _hijo = _sp.Popen([sys.executable, _os.path.abspath(__file__), "--solo-ventana"])
-        _t0 = time.time()
         _bien = False
-        while time.time() - _t0 < 25:
-            if _os.path.exists(_marca):
-                _bien = True
+        _hijo = None
+        for _intento in (1, 2):
+            try: _os.remove(_marca)
+            except Exception: pass
+            _hijo = _sp.Popen([sys.executable, _os.path.abspath(__file__), "--solo-ventana"])
+            _t0 = time.time()
+            while time.time() - _t0 < 10:
+                if _os.path.exists(_marca):
+                    _bien = True
+                    break
+                if _hijo.poll() is not None:
+                    break
+                time.sleep(0.3)
+            if _bien:
                 break
-            if _hijo.poll() is not None:
-                break
-            time.sleep(0.3)
-        if not _bien:
-            _log("la ventana propia no llego a abrir (sin señal en 25 s); va el respaldo")
+            _log("ventana propia: intento %d sin senal; %s" % (_intento,
+                 "reintentando" if _intento == 1 else "va el respaldo"))
             try: _hijo.kill()
             except Exception: pass
+            try: _hijo.wait(timeout=3)
+            except Exception: pass
+            time.sleep(0.6)
+        if not _bien:
             _respaldo_edge()
         else:
             _log("ventana propia en marcha")
@@ -1130,7 +1138,8 @@ if __name__ == "__main__":
             import webview
             _log("pywebview importado; creando la ventana")
             _win = webview.create_window("Aven PDF", "http://127.0.0.1:8890",
-                                  width=1440, height=950, min_size=(1000, 700))
+                                  width=1440, height=950, min_size=(1000, 700),
+                                  shadow=False)
             def _senal():
                 # La página cargó dentro de la ventana: avisar al padre.
                 try:
@@ -1140,10 +1149,16 @@ if __name__ == "__main__":
                     pass
             try: _win.events.loaded += _senal
             except Exception: pass
+            _datos = _os.path.join(_dir, "webview-data")
+            try: _os.makedirs(_datos, exist_ok=True)
+            except Exception: pass
             try:
-                webview.start(gui="edgechromium")
+                webview.start(gui="edgechromium", storage_path=_datos)
             except TypeError:
-                webview.start()
+                try:
+                    webview.start(gui="edgechromium")
+                except TypeError:
+                    webview.start()
             _log("ventana cerrada normalmente")
         except Exception:
             _log("FALLO ventana propia:\n" + _tb.format_exc())
