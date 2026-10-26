@@ -97,12 +97,19 @@ for whl in sorted(_elegidas.values()):
 if not any("cp313" in os.path.basename(p) for p in glob.glob(SP + "/PIL/_imaging*.pyd")):
     _fallo("falta PIL/_imaging para cp313 en el paquete: las ruedas se descargaron para otro Python (corregir el paso de descarga del workflow)")
 
-# 3) proxy_tools solo existe como .tar.gz
+# 3) proxy_tools solo existe como .tar.gz. OJO: su contenido es un PAQUETE
+# (proxy_tools/__init__.py), no un archivo suelto proxy_tools.py: se copia
+# el paquete entero (y el archivo suelto si alguna version lo trajera).
 for sdist in glob.glob("build/wheels/proxy_tools-*.tar.gz"):
     with tarfile.open(sdist) as t:
         for m in t.getmembers():
-            if m.name.endswith("proxy_tools.py"):
-                open(SP + "/proxy_tools.py", "wb").write(t.extractfile(m).read())
+            if not m.isfile():
+                continue
+            resto = "/".join(m.name.split("/")[1:])  # sin la carpeta raiz del sdist
+            if resto == "proxy_tools.py" or resto.startswith("proxy_tools/"):
+                destino = os.path.join(SP, resto)
+                os.makedirs(os.path.dirname(destino), exist_ok=True)
+                open(destino, "wb").write(t.extractfile(m).read())
 
 # 3.5) Runtime de Visual C++ junto al programa: onnxruntime (OCR) lo
 # necesita y no toda PC lo trae; sin el, el OCR muere con "DLL load failed".
@@ -159,8 +166,10 @@ if os.path.exists(_exe):
 # este sano (en la PC del usuario importa bien); por eso el import aqui es un
 # AVISO y el candado es que no falte ninguna pieza de la ventana en el paquete.
 _faltan = [r for r in (SP + "/webview/__init__.py", SP + "/webview/platforms/winforms.py",
-                       SP + "/proxy_tools.py", SP + "/pythonnet/__init__.py",
+                       SP + "/pythonnet/__init__.py",
                        SP + "/clr_loader/__init__.py") if not os.path.exists(r)]
+if not (os.path.exists(SP + "/proxy_tools.py") or os.path.exists(SP + "/proxy_tools/__init__.py")):
+    _faltan.append(SP + "/proxy_tools")
 if _faltan:
     _fallo("faltan piezas de la ventana en el paquete: " + ", ".join(_faltan))
 _r = subprocess.run([_exe, "-c", "import webview, proxy_tools; print('pywebview OK')"],
