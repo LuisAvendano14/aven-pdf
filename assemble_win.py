@@ -95,7 +95,7 @@ for whl in sorted(_elegidas.values()):
 # dentro del paquete; si no está, las ruedas se descargaron para otro
 # Python y todo lo que usa PIL fallaría en la PC del usuario.
 if not any("cp313" in os.path.basename(p) for p in glob.glob(SP + "/PIL/_imaging*.pyd")):
-    raise SystemExit("ERROR: falta PIL/_imaging para cp313 en el paquete: las ruedas se descargaron para otro Python (corregir el paso de descarga del workflow)")
+    _fallo("falta PIL/_imaging para cp313 en el paquete: las ruedas se descargaron para otro Python (corregir el paso de descarga del workflow)")
 
 # 3) proxy_tools solo existe como .tar.gz
 for sdist in glob.glob("build/wheels/proxy_tools-*.tar.gz"):
@@ -127,6 +127,15 @@ shutil.copy("app/aven.ico", BASE + "/app/aven.ico")
 # aquí con un mensaje claro, en vez de entregar un instalador que falla en
 # silencio en la PC del usuario.
 import subprocess
+
+def _fallo(msg):
+    # La anotación ::error:: se ve en la página de la corrida de GitHub,
+    # así el fallo se puede leer sin abrir el registro completo.
+    limpio = (str(msg).replace("%", "%25").replace("\r", " ")
+              .replace("\n", " | ")[-800:])
+    print("::error title=AvenPDF assemble::" + limpio)
+    raise SystemExit("ERROR: " + str(msg))
+
 _exe = os.path.join(BASE, "python", "python.exe")
 if os.path.exists(_exe):
     _pruebas = [
@@ -144,21 +153,23 @@ if os.path.exists(_exe):
         print((_r.stdout or "").strip())
         if _r.returncode != 0:
             print(_r.stderr)
-            raise SystemExit("ERROR: " + _nombre_p + " quedo roto en el paquete; compilacion detenida a proposito")
+            _fallo(_nombre_p + " quedo roto en el paquete: " + (_r.stderr or "")[-400:])
 # La ventana (pywebview) se verifica por PRESENCIA de piezas: importarla en
 # el runner puede fallar por el entorno .NET de esa maquina aunque el paquete
 # este sano (en la PC del usuario importa bien); por eso el import aqui es un
 # AVISO y el candado es que no falte ninguna pieza de la ventana en el paquete.
-for _ruta in (SP + "/webview/__init__.py", SP + "/webview/platforms/winforms.py",
-              SP + "/proxy_tools.py", SP + "/pythonnet/__init__.py",
-              SP + "/clr_loader/__init__.py"):
-    if not os.path.exists(_ruta):
-        raise SystemExit("ERROR: falta una pieza de la ventana en el paquete: " + _ruta)
+_faltan = [r for r in (SP + "/webview/__init__.py", SP + "/webview/platforms/winforms.py",
+                       SP + "/proxy_tools.py", SP + "/pythonnet/__init__.py",
+                       SP + "/clr_loader/__init__.py") if not os.path.exists(r)]
+if _faltan:
+    _fallo("faltan piezas de la ventana en el paquete: " + ", ".join(_faltan))
 _r = subprocess.run([_exe, "-c", "import webview, proxy_tools; print('pywebview OK')"],
                     capture_output=True, text=True)
 if _r.returncode == 0:
     print((_r.stdout or "").strip())
 else:
-    print("AVISO: import webview no paso en el runner (presencia de piezas verificada):")
+    _err1 = ((_r.stderr or "").strip().splitlines() or [""])[-1]
+    print("::warning title=AvenPDF assemble::import webview no paso en el runner (piezas verificadas): "
+          + _err1.replace("%", "%25")[:300])
     print(_r.stderr)
 print("payload listo:", count, "ruedas integradas")
