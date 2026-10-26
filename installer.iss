@@ -3,7 +3,7 @@
 [Setup]
 AppId={{B7A51C2E-3D4F-4E5A-9B6C-1A2B3C4D5E6F}
 AppName=Aven PDF
-AppVersion=1.10
+AppVersion=1.11
 CloseApplications=yes
 RestartApplications=no
 AppPublisher=Aven
@@ -36,3 +36,26 @@ Name: "{autodesktop}\Aven PDF"; Filename: "{app}\python\pythonw.exe"; Parameters
 
 [Run]
 Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\app\aven_pdf.py"" --ventana"; WorkingDir: "{app}\app"; Description: "Abrir Aven PDF ahora"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  DetectCmd, KillCmd: String;
+begin
+  Result := '';
+  DetectCmd := '-NoProfile -Command "$p = Get-Process pythonw,python -ErrorAction SilentlyContinue | Where-Object { $_.Path -like ''' + ExpandConstant('{app}') + '*'' }; if ($p) { exit 10 } else { exit 0 }"';
+  if Exec('powershell.exe', DetectCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 10) then
+  begin
+    if MsgBox('Aven PDF esta abierto en este momento.' + #13#10 + #13#10 +
+              'Cierro la ventana anterior y continuo con la instalacion?',
+              mbConfirmation, MB_OKCANCEL) = IDOK then
+    begin
+      KillCmd := '-NoProfile -Command "Get-Process pythonw,python -ErrorAction SilentlyContinue | Where-Object { $_.Path -like ''' + ExpandConstant('{app}') + '*'' } | Stop-Process -Force"';
+      Exec('powershell.exe', KillCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      Sleep(900);
+    end
+    else
+      Result := 'Instalacion cancelada: cierra Aven PDF y vuelve a ejecutar el instalador.';
+  end;
+end;
