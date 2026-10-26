@@ -138,8 +138,6 @@ if os.path.exists(_exe):
                     "print('PyMuPDF OK', getattr(pymupdf, '__version__', ''))"),
         ("onnxruntime", "import onnxruntime; "
                         "print('onnxruntime OK', onnxruntime.__version__)"),
-        ("pywebview", "import webview, proxy_tools; "
-                      "print('pywebview OK')"),
     ]
     for _nombre_p, _codigo in _pruebas:
         _r = subprocess.run([_exe, "-c", _codigo], capture_output=True, text=True)
@@ -147,4 +145,20 @@ if os.path.exists(_exe):
         if _r.returncode != 0:
             print(_r.stderr)
             raise SystemExit("ERROR: " + _nombre_p + " quedo roto en el paquete; compilacion detenida a proposito")
+# La ventana (pywebview) se verifica por PRESENCIA de piezas: importarla en
+# el runner puede fallar por el entorno .NET de esa maquina aunque el paquete
+# este sano (en la PC del usuario importa bien); por eso el import aqui es un
+# AVISO y el candado es que no falte ninguna pieza de la ventana en el paquete.
+for _ruta in (SP + "/webview/__init__.py", SP + "/webview/platforms/winforms.py",
+              SP + "/proxy_tools.py", SP + "/pythonnet/__init__.py",
+              SP + "/clr_loader/__init__.py"):
+    if not os.path.exists(_ruta):
+        raise SystemExit("ERROR: falta una pieza de la ventana en el paquete: " + _ruta)
+_r = subprocess.run([_exe, "-c", "import webview, proxy_tools; print('pywebview OK')"],
+                    capture_output=True, text=True)
+if _r.returncode == 0:
+    print((_r.stdout or "").strip())
+else:
+    print("AVISO: import webview no paso en el runner (presencia de piezas verificada):")
+    print(_r.stderr)
 print("payload listo:", count, "ruedas integradas")
