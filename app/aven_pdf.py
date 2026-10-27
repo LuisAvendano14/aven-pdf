@@ -52,13 +52,20 @@ def api_info(d):
     if doc.is_encrypted and not doc.authenticate(d.get("password") or ""):
         raise ValueError("El PDF está protegido con contraseña: se te pedirá en una ventana al abrirlo")
     md = doc.metadata or {}
-    return {"pages": doc.page_count, "encrypted": doc.is_encrypted,
+    out = {"pages": doc.page_count, "encrypted": doc.is_encrypted,
             "title": md.get("title") or "", "author": md.get("author") or "",
             "creator": md.get("creator") or "", "producer": md.get("producer") or "",
             "size_kb": round(len(data) / 1024, 1),
             "page_sizes": [[round(p.rect.width), round(p.rect.height)] for p in doc],
             "bookmarks": len(doc.get_toc()),
             "toc": [[lv, t, pg] for (lv, t, pg) in doc.get_toc()]}
+    if d.get("thumb") and doc.page_count:
+        try:
+            _pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(0.3, 0.3))
+            out["thumb"] = b64e(_pix.tobytes("png"))
+        except Exception:
+            pass
+    return out
 
 
 # ===== Almacén de documentos (1.7): el cliente sube el PDF una sola vez y
@@ -140,7 +147,7 @@ def api_merge(d):
         for p in r.pages: w.add_page(p)
         if d.get("_prog"): d["_prog"](_k * 100 // max(1, len(d["pdfs"])))
     buf = io.BytesIO(); w.write(buf)
-    return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
+    return {"_raw_out": buf.getvalue(), "pages": len(w.pages)}
 
 def api_extract(d):
     r = PdfReader(io.BytesIO(P(d)))
@@ -149,7 +156,7 @@ def api_extract(d):
     w = PdfWriter()
     for i in idx: w.add_page(r.pages[i])
     buf = io.BytesIO(); w.write(buf)
-    return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
+    return {"_raw_out": buf.getvalue(), "pages": len(w.pages)}
 
 def api_split_each(d):
     r = PdfReader(io.BytesIO(P(d)))
@@ -209,7 +216,7 @@ def api_rotate(d):
     deg = int(d.get("degrees", 90))
     for i in idx:
         doc[i].set_rotation((doc[i].rotation + deg) % 360)
-    return {"pdf": b64e(doc.tobytes()), "pages": doc.page_count}
+    return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
 
 def api_delete_pages(d):
     doc = _open_tol(d)
@@ -217,7 +224,7 @@ def api_delete_pages(d):
     if not drop: raise ValueError("Indica qué páginas borrar")
     if len(drop) >= doc.page_count: raise ValueError("No puedes borrar todas las páginas")
     doc.select([i for i in range(doc.page_count) if i not in drop])
-    return {"pdf": b64e(doc.tobytes()), "pages": doc.page_count}
+    return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
 
 def api_watermark(d):
     doc = pymupdf.open(stream=P(d), filetype="pdf")
@@ -687,7 +694,7 @@ def api_reorder(d):
     w = PdfWriter()
     for i in order: w.add_page(r.pages[i])
     buf = io.BytesIO(); w.write(buf)
-    return {"pdf": b64e(buf.getvalue()), "pages": len(w.pages)}
+    return {"_raw_out": buf.getvalue(), "pages": len(w.pages)}
 
 
 def api_extract_images(d):
@@ -912,7 +919,12 @@ def api_job_start(d):
         args["_prog"] = _job_cb(jid)
         try:
             out = fn(args)
-            if isinstance(out, dict) and isinstance(out.get("pdf"), str):
+            if isinstance(out, dict) and isinstance(out.get("_raw_out"), (bytes, bytearray)):
+                _raw = bytes(out.pop("_raw_out"))
+                try: out["doc_id"] = store_doc(_raw)
+                except Exception: pass
+                out["pdf"] = None if args.get("light") else b64e(_raw)
+            elif isinstance(out, dict) and isinstance(out.get("pdf"), str):
                 try: out["doc_id"] = store_doc(b64d(out["pdf"]))
                 except Exception: pass
             with JOBS_LOCK: JOBS[jid].update(done=True, result=out, pct=100)
@@ -1019,7 +1031,12 @@ class H(BaseHTTPRequestHandler):
                     raise ValueError("El documento ya no está en la memoria del programa (se abrieron otros después). Vuelve a abrir el PDF.")
                 d["_raw"] = _data
             out = fn(d); code = 200
-            if self.path != "/api/fetch_doc" and isinstance(out, dict) and isinstance(out.get("pdf"), str):
+            if isinstance(out, dict) and isinstance(out.get("_raw_out"), (bytes, bytearray)):
+                _raw = bytes(out.pop("_raw_out"))
+                try: out["doc_id"] = store_doc(_raw)
+                except Exception: pass
+                out["pdf"] = None if d.get("light") else b64e(_raw)
+            elif self.path != "/api/fetch_doc" and isinstance(out, dict) and isinstance(out.get("pdf"), str):
                 try: out["doc_id"] = store_doc(b64d(out["pdf"]))
                 except Exception: pass
             if d.get("light") and isinstance(out, dict) and out.get("doc_id") and isinstance(out.get("pdf"), str):
@@ -1135,6 +1152,12 @@ if __name__ == "__main__":
             pass
         try:
             _log("importando pywebview...")
+            try:
+                from pythonnet import load as _pn_load
+                _pn_load("netfx")
+                _log("pythonnet: runtime .NET Framework forzado")
+            except Exception as _pe:
+                _log("pythonnet: sin forzar (" + str(_pe)[:90] + ")")
             import webview
             _log("pywebview importado; creando la ventana")
             _win = webview.create_window("Aven PDF", "http://127.0.0.1:8890",
