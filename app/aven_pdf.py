@@ -61,7 +61,10 @@ def api_info(d):
             "toc": [[lv, t, pg] for (lv, t, pg) in doc.get_toc()]}
     if d.get("thumb") and doc.page_count:
         try:
-            _pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(0.3, 0.3))
+            _z = 0.3
+            try: _z = min(1.6, max(0.1, float(d.get("thumbz") or 0.3)))
+            except Exception: pass
+            _pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(_z, _z))
             out["thumb"] = b64e(_pix.tobytes("png"))
         except Exception:
             pass
@@ -605,13 +608,37 @@ def api_text_at(d):
     spans = line["spans"]
     dom = max(spans, key=lambda s: len(s["text"]))
     o = spans[0]["origin"]; col = dom["color"]
+    dv = line.get("dir") or (1, 0)
+    _fl = dom.get("flags", 0); _fn = (dom["font"] or "").lower()
     return {"found": True, "text": text, "bbox": [r.x0, r.y0, r.x1, r.y1],
             "origin": [o[0], o[1]], "size": dom["size"], "font": dom["font"],
             "color": [(col >> 16 & 255) / 255, (col >> 8 & 255) / 255, (col & 255) / 255],
+            "dir": [dv[0], dv[1]],
+            "bold": bool(_fl & 16) or any(k in _fn for k in ("bold", "black", "heavy")),
+            "italic": bool(_fl & 2) or ("italic" in _fn) or ("oblique" in _fn),
             "page_w": W, "page_h": H}
 
+def _fontpick(orig, family, bold, italic):
+    """Fuente base-14 segun la familia pedida (o la de la fuente original) y B/I."""
+    low = (orig or "").lower()
+    if family in ("helv", "tiro", "cour"):
+        base = {"helv": "he", "tiro": "ti", "cour": "co"}[family]
+    elif "courier" in low or "mono" in low:
+        base = "co"
+    elif "times" in low or "roman" in low or "georgia" in low or "serif" in low:
+        base = "ti"
+    else:
+        base = "he"
+    suf = {"he": {"": "lv", "b": "bo", "i": "it", "bi": "bi"},
+           "ti": {"": "ro", "b": "bo", "i": "it", "bi": "bi"},
+           "co": {"": "ur", "b": "bo", "i": "it", "bi": "bi"}}[base]
+    return base + suf[("b" if bold else "") + ("i" if italic else "")]
+
+
 def api_edit_line(d):
-    """Reemplaza UNA linea: borra la original (sin tocar bordes ni imagenes) y escribe la nueva en su sitio."""
+    """Reemplaza UNA linea conservando sitio y orientacion (tambien las verticales),
+    con el formato pedido: negrita, cursiva, subrayado, tachado, letra, tamano,
+    color y fondo. Solo se borra esa linea (sin tocar bordes ni imagenes)."""
     doc = pymupdf.open(stream=P(d), filetype="pdf")
     if d.get("password") and doc.authenticate(d["password"]) <= 0:
         raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
@@ -626,11 +653,112 @@ def api_edit_line(d):
     new = d.get("text") or ""
     if new.strip():
         col = d.get("color") or [0, 0, 0]
-        page.insert_text((float(d["origin"][0]), float(d["origin"][1])), new,
-                         fontsize=float(d.get("size") or 11),
-                         fontname=_fontname(d.get("font")),
-                         color=(float(col[0]), float(col[1]), float(col[2])))
-    return {"pdf": b64e(doc.tobytes(garbage=3, deflate=True)), "pages": doc.page_count}
+        col = (float(col[0]), float(col[1]), float(col[2]))
+        size = float(d.get("size") or 11)
+        fname0 = d.get("font") or ""
+        low = fname0.lower()
+        bold = d.get("bold")
+        if bold is None: bold = any(k in low for k in ("bold", "black", "heavy", "semibold"))
+        italic = d.get("italic")
+        if italic is None: italic = ("italic" in low) or ("oblique" in low)
+        fn = _fontpick(fname0, d.get("family"), bool(bold), bool(italic))
+        dv = d.get("dir") or [1, 0]
+        dx, dy = float(dv[0]), float(dv[1])
+        n = (dx * dx + dy * dy) ** 0.5 or 1.0
+        dx, dy = dx / n, dy / n
+        if abs(dx) >= abs(dy):
+            rot, dvx, dvy = (0, 1.0, 0.0) if dx >= 0 else (180, -1.0, 0.0)
+        else:
+            rot, dvx, dvy = (90, 0.0, -1.0) if dy < 0 else (270, 0.0, 1.0)
+        ox, oy = float(d["origin"][0]), float(d["origin"][1])
+        tl = pymupdf.get_text_length(new, fontname=fn, fontsize=size)
+        px, py = -dvy, dvx
+        bg = d.get("bg")
+        if bg:
+            bgc = (float(bg[0]), float(bg[1]), float(bg[2]))
+            c1 = (ox - px * size * 0.88 - dvx * 2, oy - py * size * 0.88 - dvy * 2)
+            c2 = (ox + dvx * tl - px * size * 0.88 + dvx * 2, oy + dvy * tl - py * size * 0.88 + dvy * 2)
+            c3 = (ox + dvx * tl + px * size * 0.30 + dvx * 2, oy + dvy * tl + py * size * 0.30 + dvy * 2)
+            c4 = (ox + px * size * 0.30 - dvx * 2, oy + py * size * 0.30 - dvy * 2)
+            sh = page.new_shape()
+            sh.draw_polyline([pymupdf.Point(*c1), pymupdf.Point(*c2),
+                              pymupdf.Point(*c3), pymupdf.Point(*c4)])
+            sh.finish(color=None, fill=bgc, closePath=True)
+            sh.commit()
+        page.insert_text((ox, oy), new, fontsize=size, fontname=fn, color=col, rotate=rot)
+        if d.get("underline") or d.get("strike"):
+            sh = page.new_shape()
+            wln = max(0.5, size * 0.06)
+            if d.get("underline"):
+                o = size * 0.16
+                sh.draw_line(pymupdf.Point(ox + px * o, oy + py * o),
+                             pymupdf.Point(ox + dvx * tl + px * o, oy + dvy * tl + py * o))
+                sh.finish(color=col, width=wln, closePath=False)
+            if d.get("strike"):
+                o = -size * 0.30
+                sh.draw_line(pymupdf.Point(ox + px * o, oy + py * o),
+                             pymupdf.Point(ox + dvx * tl + px * o, oy + dvy * tl + py * o))
+                sh.finish(color=col, width=wln, closePath=False)
+            sh.commit()
+    return {"_raw_out": doc.tobytes(garbage=3, deflate=True), "pages": doc.page_count}
+
+
+def api_place_image(d):
+    """Inserta una imagen sobre una pagina: centro, ancho, giro y ajustes de
+    brillo/contraste que el usuario dejo en la vista previa."""
+    doc = pymupdf.open(stream=P(d), filetype="pdf")
+    if d.get("password") and doc.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
+    page = doc[int(d.get("page", 0))]
+    from PIL import Image, ImageEnhance
+    import math
+    im = Image.open(io.BytesIO(b64d(d["img"])))
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGBA")
+    br = float(d.get("bright") or 1.0); ct = float(d.get("contrast") or 1.0)
+    if br != 1.0: im = ImageEnhance.Brightness(im).enhance(br)
+    if ct != 1.0: im = ImageEnhance.Contrast(im).enhance(ct)
+    ang = float(d.get("angle") or 0) % 360
+    w_pt = float(d["w_pt"])
+    h_pt = w_pt * im.height / max(1, im.width)
+    if ang:
+        im = im.rotate(-ang, expand=True, resample=Image.BICUBIC)
+    rad = math.radians(ang)
+    ca, sa = abs(math.cos(rad)), abs(math.sin(rad))
+    bw = w_pt * ca + h_pt * sa
+    bh = w_pt * sa + h_pt * ca
+    cx, cy = float(d["cx"]), float(d["cy"])
+    rect = pymupdf.Rect(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2)
+    buf = io.BytesIO(); im.save(buf, format="PNG")
+    page.insert_image(rect, stream=buf.getvalue())
+    return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
+
+
+def api_draw_strokes(d):
+    """Aplica los trazos de lapiz/resaltador dibujados sobre una pagina."""
+    doc = pymupdf.open(stream=P(d), filetype="pdf")
+    if d.get("password") and doc.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
+    page = doc[int(d.get("page", 0))]
+    sh = page.new_shape()
+    for st in d.get("strokes") or []:
+        pts = [pymupdf.Point(float(x), float(y)) for x, y in st.get("pts") or []]
+        if not pts: continue
+        hx = (st.get("color") or "#d32f2f").lstrip("#")
+        col = tuple(int(hx[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        w = float(st.get("width") or 2)
+        op = st.get("opacity")
+        op = 1.0 if op is None else float(op)
+        if len(pts) == 1:
+            sh.draw_circle(pts[0], max(0.6, w / 2))
+            sh.finish(color=col, fill=col, width=0.5,
+                      stroke_opacity=op, fill_opacity=op, closePath=True)
+        else:
+            sh.draw_polyline(pts)
+            sh.finish(color=col, width=w, stroke_opacity=op,
+                      lineCap=1, lineJoin=1, closePath=False)
+    sh.commit()
+    return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
 
 def api_make_cert(d):
     """Genera un certificado personal autofirmado (.pfx) para firmar PDFs."""
@@ -984,6 +1112,7 @@ APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render,
         "/api/to_scanned": api_to_scanned, "/api/deskew": api_deskew,
         "/api/fetch_doc": api_fetch_doc,
         "/api/stage_download": api_stage_download, "/api/winmode": api_winmode,
+        "/api/place_image": api_place_image, "/api/draw_strokes": api_draw_strokes,
         "/api/job_start": api_job_start, "/api/job_status": api_job_status,
         "/api/job_cancel": api_job_cancel}
 
@@ -1000,7 +1129,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(404); self.end_headers(); return
             data, name, mime, _t = ent
             self.send_response(200)
-            self.send_header("Content-Type", mime)
+            self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + _q(name))
             self.send_header("Content-Length", str(len(data)))
             self.end_headers(); self.wfile.write(data)
