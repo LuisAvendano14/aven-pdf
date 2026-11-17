@@ -1024,6 +1024,249 @@ def api_winmode(d):
         pass
     return {"mode": "respaldo Edge"}
 
+
+# ---------- certificados en bloque (1.19) ----------
+import io as _io, os as _os, re as _re, tempfile as _tf, zipfile as _zf
+
+DL_FILES = {}
+_CERT_RX = _re.compile(r"\{\{[^{}]+\}\}")
+
+def _cert_fmt_val(v):
+    import datetime as _dt
+    if v is None: return ""
+    if isinstance(v, (_dt.datetime, _dt.date)): return v.strftime("%d/%m/%Y")
+    if isinstance(v, float) and v.is_integer(): return str(int(v))
+    return str(v).strip()
+
+def _cert_read_excel(xl_bytes):
+    from openpyxl import load_workbook
+    wb = load_workbook(_io.BytesIO(xl_bytes), read_only=True, data_only=True)
+    ws = wb.active
+    cols, rows = [], []
+    for row in ws.iter_rows(values_only=True):
+        vals = [_cert_fmt_val(v) for v in row]
+        if not cols:
+            if any(vals):
+                cols = [c or ("columna_%d" % (i + 1)) for i, c in enumerate(vals)]
+            continue
+        if not any(vals): continue
+        rows.append({cols[i]: (vals[i] if i < len(vals) else "") for i in range(len(cols))})
+    wb.close()
+    if not cols: raise ValueError("El Excel no tiene encabezados en la primera fila")
+    if not rows: raise ValueError("El Excel no tiene filas de datos (solo está el encabezado)")
+    if len(rows) > 20000:
+        raise ValueError("La base tiene más de 20 000 filas: divídela en partes para generar los certificados")
+    return cols, rows
+
+def _cert_slots(doc):
+    """Localiza UNA vez cada marcador {{campo}}: por ocurrencia guarda página,
+    rectángulo y estilo (tamaño, color, fuente, línea base) del propio marcador."""
+    slots = {}
+    for pno, page in enumerate(doc):
+        txt = page.get_text()
+        lits = {}
+        for m in _CERT_RX.finditer(txt):
+            nm = m.group(0)[2:-2].strip()
+            if nm: lits.setdefault(nm, m.group(0))
+        if not lits: continue
+        spans = [s for b in page.get_text("dict")["blocks"] if b["type"] == 0
+                 for l in b["lines"] for s in l["spans"]]
+        for nm, lit in lits.items():
+            rects = list(page.search_for(lit))
+            if not rects:
+                rects = [pymupdf.Rect(s["bbox"]) for s in spans if lit in s["text"]]
+            for r in rects:
+                st = {"size": 14.0, "color": (0, 0, 0), "font": "", "oy": None}
+                for s in spans:
+                    if pymupdf.Rect(s["bbox"]).intersects(r):
+                        c = int(s["color"])
+                        st = {"size": float(s["size"]),
+                              "color": ((c >> 16 & 255) / 255.0, (c >> 8 & 255) / 255.0, (c & 255) / 255.0),
+                              "font": s["font"], "oy": float(s["origin"][1])}
+                        break
+                slots.setdefault(nm, []).append(
+                    {"p": pno, "r": [r.x0, r.y0, r.x1, r.y1], "size": st["size"],
+                     "color": st["color"], "font": st["font"], "oy": st["oy"]})
+    fields = []
+    try:
+        for page in doc:
+            for w in page.widgets() or []:
+                if w.field_name and w.field_name not in fields: fields.append(w.field_name)
+    except Exception:
+        pass
+    return slots, fields
+
+def _cert_colof(cols, low, nm):
+    return nm if nm in cols else low.get(nm.lower())
+
+def _cert_tpl(d):
+    tpl = b64d(d.get("template") or "")
+    if not tpl: raise ValueError("Falta el modelo PDF")
+    return tpl
+
+def api_cert_info(d):
+    tpl = _cert_tpl(d)
+    xl = b64d(d.get("excel") or "")
+    if not xl: raise ValueError("Falta la base de datos Excel")
+    doc = pymupdf.open(stream=tpl, filetype="pdf")
+    slots, fields = _cert_slots(doc); doc.close()
+    cols, rows = _cert_read_excel(xl)
+    low = {c.lower(): c for c in cols}
+    targets = list(slots.keys()) + [f for f in fields if f not in slots]
+    if not targets:
+        raise ValueError("El modelo no tiene marcadores: escribe los datos en el PDF como {{nombre}}, {{curso}}, {{fecha}} (con doble llave), o usa un PDF con campos de formulario")
+    matched = [t for t in targets if _cert_colof(cols, low, t)]
+    missing = [t for t in targets if not _cert_colof(cols, low, t)]
+    return {"rows": len(rows), "columns": cols, "targets": targets,
+            "matched": matched, "missing": missing,
+            "sample": {t: (rows[0].get(_cert_colof(cols, low, t)) if _cert_colof(cols, low, t) else "") for t in targets}}
+
+def _cert_fname(base, used):
+    s = _re.sub(r'[\\/:*?"<>|]+', "_", base or "").strip()
+    s = _re.sub(r"\s+", " ", s)[:70].strip() or "certificado"
+    name, i = s, 2
+    while name.lower() in used:
+        name = "%s (%d)" % (s, i); i += 1
+    used.add(name.lower())
+    return name + ".pdf"
+
+def api_cert_bulk(d):
+    tpl = _cert_tpl(d)
+    xl = b64d(d.get("excel") or "")
+    if not xl: raise ValueError("Falta la base de datos Excel")
+    cols, rows = _cert_read_excel(xl)
+    low = {c.lower(): c for c in cols}
+    name_col = d.get("name_col") or (cols[0] if cols else None)
+    base_doc = pymupdf.open(stream=tpl, filetype="pdf")
+    slots, fields = _cert_slots(base_doc); base_doc.close()
+    if not slots and not fields:
+        raise ValueError("El modelo no tiene marcadores {{...}} ni campos de formulario")
+    cb = d.get("_prog")
+    tmpdir = _tf.mkdtemp(prefix="aven_cert_")
+    zpath = _os.path.join(tmpdir, "certificados.zip")
+    used = set(); total = len(rows)
+    try:
+        with _zf.ZipFile(zpath, "w", _zf.ZIP_DEFLATED, compresslevel=6) as z:
+            for i, row in enumerate(rows):
+                doc = pymupdf.open(stream=tpl, filetype="pdf")
+                for nm, occs in slots.items():
+                    c = _cert_colof(cols, low, nm)
+                    val = row.get(c) if c else ""
+                    by_page = {}
+                    for o in occs: by_page.setdefault(o["p"], []).append(o)
+                    for pno, olist in by_page.items():
+                        page = doc[pno]
+                        for o in olist:
+                            r = o["r"]
+                            page.add_redact_annot(pymupdf.Rect(r[0] - 0.6, r[1] - 0.6, r[2] + 0.6, r[3] + 0.6))
+                        try:
+                            page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                                                  graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+                        except Exception:
+                            page.apply_redactions()
+                        if val:
+                            for o in olist:
+                                r = o["r"]
+                                low_f = (o["font"] or "").lower()
+                                bold = any(k in low_f for k in ("bold", "black", "heavy", "semibold"))
+                                ital = ("italic" in low_f) or ("oblique" in low_f)
+                                fn = _fontpick(o["font"], None, bold, ital)
+                                size = float(o["size"])
+                                max_w = min(page.rect.width - 64, max((r[2] - r[0]) * 2.4, 150))
+                                while size > 6.5 and pymupdf.get_text_length(val, fontname=fn, fontsize=size) > max_w:
+                                    size -= 0.5
+                                tw = pymupdf.get_text_length(val, fontname=fn, fontsize=size)
+                                cx = (r[0] + r[2]) / 2.0
+                                oy = o["oy"] if o["oy"] else r[3] - size * 0.25
+                                page.insert_text((max(24.0, cx - tw / 2.0), oy), val,
+                                                 fontsize=size, fontname=fn, color=o["color"])
+                if fields:
+                    for page in doc:
+                        for w in page.widgets() or []:
+                            c = _cert_colof(cols, low, w.field_name)
+                            if c:
+                                try:
+                                    w.field_value = row.get(c) or ""; w.update()
+                                except Exception:
+                                    pass
+                z.writestr(_cert_fname(row.get(name_col) if name_col else "", used),
+                           doc.tobytes(garbage=3, deflate=True))
+                doc.close()
+                if cb and (i % 5 == 0 or i == total - 1): cb((i + 1) * 100.0 / total)
+    except Exception:
+        try: _os.remove(zpath)
+        except Exception: pass
+        raise
+    tok = uuid.uuid4().hex[:16]
+    with DL_LOCK:
+        DL_FILES[tok] = (zpath, "certificados.zip", time.time())
+        for _k in [k for k, v in DL_FILES.items() if time.time() - v[2] > 900]:
+            _p = DL_FILES.pop(_k)[0]
+            try: _os.remove(_p)
+            except Exception: pass
+    return {"dlf": "/dlf/" + tok, "count": total,
+            "zip_mb": round(_os.path.getsize(zpath) / 1048576.0, 1)}
+
+
+def api_object_at(d):
+    """Qué hay bajo el clic en modo edición: una línea de texto (con aviso si
+    es una línea de relleno ______), una línea DIBUJADA, un dibujo o una
+    imagen. Antes las líneas dibujadas no se reconocían y no se podían borrar."""
+    doc0 = pymupdf.open(stream=P(d), filetype="pdf")
+    if d.get("password") and doc0.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
+    page = doc0[int(d.get("page", 0))]
+    pw, ph = page.rect.width, page.rect.height
+    t = api_text_at(d)
+    if t.get("found"):
+        txt = (t.get("text") or "").strip()
+        blank = bool(txt) and all(ch in "_—–-.· " for ch in txt)
+        out = dict(t); out.update({"kind": "text", "blank": blank, "page_w": pw, "page_h": ph})
+        return out
+    pt = pymupdf.Point(float(d["fx"]) * pw, float(d["fy"]) * ph)
+    best = None
+    try: drawings = page.get_drawings()
+    except Exception: drawings = []
+    for dr in drawings:
+        r = dr["rect"]
+        if pymupdf.Rect(r.x0 - 2, r.y0 - 3, r.x1 + 2, r.y1 + 3).contains(pt):
+            area = max(r.width, 0.1) * max(r.height, 0.1)
+            if best is None or area < best[0]: best = (area, r)
+    if best is not None:
+        r = best[1]
+        kind = "linea" if (r.height <= 3.5 or r.width <= 3.5) else "dibujo"
+        return {"kind": kind, "rect": [r.x0, r.y0, r.x1, r.y1], "page_w": pw, "page_h": ph}
+    try:
+        for img in page.get_images(full=True):
+            for r in page.get_image_rects(img[0]):
+                if r.contains(pt):
+                    return {"kind": "imagen", "rect": [r.x0, r.y0, r.x1, r.y1], "page_w": pw, "page_h": ph}
+    except Exception:
+        pass
+    return {"kind": None, "page_w": pw, "page_h": ph}
+
+def api_delete_object(d):
+    """Borra SOLO el objeto elegido (línea/dibujo o imagen) con redacción
+    quirúrgica: el texto y el resto de la página quedan intactos."""
+    doc = pymupdf.open(stream=P(d), filetype="pdf")
+    if d.get("password") and doc.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
+    page = doc[int(d.get("page", 0))]
+    r = [float(v) for v in d["rect"]]
+    # las líneas son trazos de alto cero: la redacción necesita holgura
+    # vertical (±3) para alcanzarlas en modo "cubierto"; con ±0,4 no caen
+    ey = 3.0 if (d.get("kind") or "") == "linea" else 1.0
+    page.add_redact_annot(pymupdf.Rect(r[0] - 0.6, r[1] - ey, r[2] + 0.6, r[3] + ey))
+    if (d.get("kind") or "") == "imagen":
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                              text=pymupdf.PDF_REDACT_TEXT_NONE)
+    else:
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                              text=pymupdf.PDF_REDACT_TEXT_NONE)
+    return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
+
 def api_job_start(d):
     op = d.get("op") or ""
     fn = APIS.get(op)
@@ -1112,6 +1355,10 @@ APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render,
         "/api/to_scanned": api_to_scanned, "/api/deskew": api_deskew,
         "/api/fetch_doc": api_fetch_doc,
         "/api/stage_download": api_stage_download, "/api/winmode": api_winmode,
+    "/api/cert_info": api_cert_info,
+    "/api/cert_bulk": api_cert_bulk,
+    "/api/object_at": api_object_at,
+    "/api/delete_object": api_delete_object,
         "/api/place_image": api_place_image, "/api/draw_strokes": api_draw_strokes,
         "/api/job_start": api_job_start, "/api/job_status": api_job_status,
         "/api/job_cancel": api_job_cancel}
@@ -1121,6 +1368,29 @@ from aven_ui import UI
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
+        if self.path.startswith("/dlf/"):
+            from urllib.parse import quote as _q2
+            tok = self.path[5:].split("?")[0]
+            with DL_LOCK: ent = DL_FILES.pop(tok, None)
+            if ent is None:
+                self.send_response(404); self.end_headers(); return
+            pathf, name, _t = ent
+            try: size = _os.path.getsize(pathf)
+            except Exception:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + _q2(name))
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(pathf, "rb") as fh:
+                while True:
+                    chunk = fh.read(262144)
+                    if not chunk: break
+                    self.wfile.write(chunk)
+            try: _os.remove(pathf)
+            except Exception: pass
+            return
         if self.path.startswith("/dl/"):
             from urllib.parse import quote as _q
             tok = self.path[4:].split("?")[0]
