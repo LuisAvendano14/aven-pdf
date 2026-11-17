@@ -1231,11 +1231,14 @@ def api_object_at(d):
         r = dr["rect"]
         if pymupdf.Rect(r.x0 - 2, r.y0 - 3, r.x1 + 2, r.y1 + 3).contains(pt):
             area = max(r.width, 0.1) * max(r.height, 0.1)
-            if best is None or area < best[0]: best = (area, r)
+            if best is None or area < best[0]: best = (area, r, dr)
     if best is not None:
-        r = best[1]
+        r, dr = best[1], best[2]
         kind = "linea" if (r.height <= 3.5 or r.width <= 3.5) else "dibujo"
-        return {"kind": kind, "rect": [r.x0, r.y0, r.x1, r.y1], "page_w": pw, "page_h": ph}
+        return {"kind": kind, "rect": [r.x0, r.y0, r.x1, r.y1], "page_w": pw, "page_h": ph,
+                "color": list(dr["color"]) if dr.get("color") else [0, 0, 0],
+                "width": dr.get("width") or 1,
+                "fill": list(dr["fill"]) if dr.get("fill") else None}
     try:
         for img in page.get_images(full=True):
             for r in page.get_image_rects(img[0]):
@@ -1265,6 +1268,43 @@ def api_delete_object(d):
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
                               graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
                               text=pymupdf.PDF_REDACT_TEXT_NONE)
+    return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
+
+
+def api_restyle_object(d):
+    """Cambia el color y el grosor de una línea o dibujo SIN moverlo: se
+    localiza el trazo exacto, se retira y se redibuja igual con el estilo
+    nuevo. Las formas complejas (curvas) solo admiten borrado, y se avisa."""
+    doc = pymupdf.open(stream=P(d), filetype="pdf")
+    if d.get("password") and doc.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
+    page = doc[int(d.get("page", 0))]
+    r = [float(v) for v in d["rect"]]
+    target = None
+    for dr in page.get_drawings():
+        if all(abs(a - b) < 0.6 for a, b in zip(dr["rect"], pymupdf.Rect(*r))):
+            target = dr; break
+    if target is None:
+        raise ValueError("Ya no se encuentra ese objeto en la página (¿se editó el documento después de seleccionarlo?)")
+    items = target["items"]
+    if not items or any(it[0] not in ("l", "re") for it in items):
+        raise ValueError("Este objeto es una forma compleja (curvas): por ahora solo se puede borrar. Las líneas y los recuadros sí aceptan color y grosor.")
+    col = tuple(float(v) for v in d["color"])
+    wid = max(0.3, min(12.0, float(d.get("width") or 1)))
+    ey = 3.0 if (d.get("kind") or "") == "linea" else 1.0
+    page.add_redact_annot(pymupdf.Rect(r[0] - 0.6, r[1] - ey, r[2] + 0.6, r[3] + ey))
+    page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                          graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                          text=pymupdf.PDF_REDACT_TEXT_NONE)
+    sh = page.new_shape()
+    for it in items:
+        if it[0] == "l": sh.draw_line(it[1], it[2])
+        else: sh.draw_rect(it[1])
+    if target.get("fill") is not None:
+        sh.finish(color=col, fill=col, width=wid)
+    else:
+        sh.finish(color=col, fill=None, width=wid)
+    sh.commit()
     return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
 
 def api_job_start(d):
@@ -1359,6 +1399,7 @@ APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render,
     "/api/cert_bulk": api_cert_bulk,
     "/api/object_at": api_object_at,
     "/api/delete_object": api_delete_object,
+    "/api/restyle_object": api_restyle_object,
         "/api/place_image": api_place_image, "/api/draw_strokes": api_draw_strokes,
         "/api/job_start": api_job_start, "/api/job_status": api_job_status,
         "/api/job_cancel": api_job_cancel}
