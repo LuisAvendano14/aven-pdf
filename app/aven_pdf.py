@@ -145,8 +145,18 @@ def api_render(d):
 
 def api_merge(d):
     w = PdfWriter()
-    for _k, item in enumerate(d["pdfs"], 1):
-        r = PdfReader(io.BytesIO(b64d(item)))
+    _items = []
+    if d.get("doc_ids"):
+        for _did in d["doc_ids"]:
+            with DOCS_LOCK:
+                _data = DOCS.get(_did)
+            if _data is None:
+                raise ValueError("Uno de los PDF ya no está en la memoria del programa: vuelve a elegirlo.")
+            _items.append(_data)
+    else:
+        _items = [b64d(x) for x in d["pdfs"]]
+    for _k, item in enumerate(_items, 1):
+        r = PdfReader(io.BytesIO(item if isinstance(item, (bytes, bytearray)) else b64d(item)))
         for p in r.pages: w.add_page(p)
         if d.get("_prog"): d["_prog"](_k * 100 // max(1, len(d["pdfs"])))
     buf = io.BytesIO(); w.write(buf)
@@ -587,6 +597,7 @@ def api_text_at(d):
     page = doc[int(d.get("page", 0))]
     W, H = page.rect.width, page.rect.height
     pt = pymupdf.Point(float(d["fx"]) * W, float(d["fy"]) * H)
+    _tol = float(d.get("tol") or 4)
     best = None; best_area = None; near = None; near_dist = 1e18
     for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0: continue
@@ -599,7 +610,7 @@ def api_text_at(d):
             if r.contains(pt):
                 if best is None or r.width * r.height < best_area:
                     best = (line, r, text); best_area = r.width * r.height
-            elif pymupdf.Rect(r.x0 - 2, r.y0 - 4, r.x1 + 2, r.y1 + 4).contains(pt):
+            elif pymupdf.Rect(r.x0 - 2 - _tol / 2, r.y0 - _tol, r.x1 + 2 + _tol / 2, r.y1 + _tol).contains(pt):
                 dist = ((r.x0 + r.x1) / 2 - pt.x) ** 2 + ((r.y0 + r.y1) / 2 - pt.y) ** 2
                 if dist < near_dist: near = (line, r, text); near_dist = dist
     pick = best or near
@@ -1244,6 +1255,9 @@ def api_object_at(d):
     page = doc0[int(d.get("page", 0))]
     pw, ph = page.rect.width, page.rect.height
     t = api_text_at(d)
+    if not t.get("found"):
+        _d2 = dict(d); _d2["tol"] = 14
+        t = api_text_at(_d2)
     if t.get("found"):
         txt = (t.get("text") or "").strip()
         blank = bool(txt) and all(ch in "_—–-.· " for ch in txt)
