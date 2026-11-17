@@ -1113,6 +1113,8 @@ def api_cert_info(d):
     cols, rows = _cert_read_excel(xl)
     low = {c.lower(): c for c in cols}
     targets = list(slots.keys()) + [f for f in fields if f not in slots]
+    for nm in (d.get("names") or []):
+        if nm and nm not in targets: targets.append(nm)
     if not targets:
         raise ValueError("El modelo no tiene marcadores: escribe los datos en el PDF como {{nombre}}, {{curso}}, {{fecha}} (con doble llave), o usa un PDF con campos de formulario")
     matched = [t for t in targets if _cert_colof(cols, low, t)]
@@ -1136,11 +1138,14 @@ def api_cert_bulk(d):
     if not xl: raise ValueError("Falta la base de datos Excel")
     cols, rows = _cert_read_excel(xl)
     low = {c.lower(): c for c in cols}
+    _lim = int(d.get("limit") or 0)
+    if _lim > 0: rows = rows[:_lim]
     name_col = d.get("name_col") or (cols[0] if cols else None)
     base_doc = pymupdf.open(stream=tpl, filetype="pdf")
     slots, fields = _cert_slots(base_doc); base_doc.close()
-    if not slots and not fields:
-        raise ValueError("El modelo no tiene marcadores {{...}} ni campos de formulario")
+    placed = [f for f in (d.get("fields") or []) if (f.get("name") or "").strip()]
+    if not slots and not fields and not placed:
+        raise ValueError("El modelo no tiene marcadores {{...}} ni campos ubicados con clics: ubica los datos primero")
     cb = d.get("_prog")
     tmpdir = _tf.mkdtemp(prefix="aven_cert_")
     zpath = _os.path.join(tmpdir, "certificados.zip")
@@ -1180,6 +1185,27 @@ def api_cert_bulk(d):
                                 oy = o["oy"] if o["oy"] else r[3] - size * 0.25
                                 page.insert_text((max(24.0, cx - tw / 2.0), oy), val,
                                                  fontsize=size, fontname=fn, color=o["color"])
+                for f in placed:
+                    _c = _cert_colof(cols, low, f.get("name") or "")
+                    _val = row.get(_c) if _c else ""
+                    if not _val: continue
+                    _pno = int(f.get("page") or 0)
+                    if _pno >= doc.page_count: continue
+                    _page = doc[_pno]
+                    _size = float(f.get("size") or 16)
+                    _fn = "hebo" if f.get("bold") else "helv"
+                    _hx = (f.get("color") or "#000000").lstrip("#")
+                    try: _col = tuple(int(_hx[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+                    except Exception: _col = (0, 0, 0)
+                    _x = float(f.get("x") or 0); _y = float(f.get("y") or 0)
+                    _al = f.get("align") or "centro"
+                    _mw = max(60.0, _page.rect.width - 48)
+                    while _size > 6.5 and pymupdf.get_text_length(_val, fontname=_fn, fontsize=_size) > _mw:
+                        _size -= 0.5
+                    _tw = pymupdf.get_text_length(_val, fontname=_fn, fontsize=_size)
+                    _ox = _x - _tw / 2.0 if _al == "centro" else (_x - _tw if _al == "derecha" else _x)
+                    _page.insert_text((max(12.0, _ox), _y + _size * 0.35), _val,
+                                      fontsize=_size, fontname=_fn, color=_col)
                 if fields:
                     for page in doc:
                         for w in page.widgets() or []:
@@ -1307,6 +1333,35 @@ def api_restyle_object(d):
     sh.commit()
     return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
 
+
+def api_cert_scan(d):
+    """Al elegir el modelo: cuántas páginas tiene y qué marcadores {{...}}
+    trae ya escritos (esos datos se ubican solos, sin clics)."""
+    doc = pymupdf.open(stream=P(d), filetype="pdf")
+    slots, fields = _cert_slots(doc)
+    npages = doc.page_count; doc.close()
+    return {"pages": npages, "markers": sorted(slots.keys()), "form_fields": fields}
+
+def api_cert_template(d):
+    """Plantilla Excel lista para llenar: una columna por dato (los ubicados
+    con clics y/o los marcadores) y dos filas de ejemplo."""
+    names = [str(n).strip() for n in (d.get("names") or []) if str(n).strip()]
+    if not names: raise ValueError("Primero ubica al menos un dato en el modelo (con clics o marcadores)")
+    from openpyxl import Workbook
+    wb = Workbook(); ws = wb.active; ws.title = "Datos"
+    ws.append(names)
+    for i in (1, 2):
+        ws.append(["Ejemplo %d (%s)" % (i, n) for n in names])
+    for col in ws.columns:
+        ws.column_dimensions[col[0].column_letter].width = 26
+    tmpdir = _tf.mkdtemp(prefix="aven_plantilla_")
+    path = _os.path.join(tmpdir, "plantilla_certificados.xlsx")
+    wb.save(path)
+    tok = uuid.uuid4().hex[:16]
+    with DL_LOCK:
+        DL_FILES[tok] = (path, "plantilla_certificados.xlsx", time.time())
+    return {"dlf": "/dlf/" + tok}
+
 def api_job_start(d):
     op = d.get("op") or ""
     fn = APIS.get(op)
@@ -1397,6 +1452,8 @@ APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render,
         "/api/stage_download": api_stage_download, "/api/winmode": api_winmode,
     "/api/cert_info": api_cert_info,
     "/api/cert_bulk": api_cert_bulk,
+    "/api/cert_scan": api_cert_scan,
+    "/api/cert_template": api_cert_template,
     "/api/object_at": api_object_at,
     "/api/delete_object": api_delete_object,
     "/api/restyle_object": api_restyle_object,
