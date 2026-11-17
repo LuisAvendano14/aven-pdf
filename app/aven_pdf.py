@@ -154,11 +154,13 @@ def api_merge(d):
                 raise ValueError("Uno de los PDF ya no está en la memoria del programa: vuelve a elegirlo.")
             _items.append(_data)
     else:
+        if not d.get("pdfs"):
+            raise ValueError("No llegaron los archivos a unir: elige los PDF de nuevo.")
         _items = [b64d(x) for x in d["pdfs"]]
     for _k, item in enumerate(_items, 1):
         r = PdfReader(io.BytesIO(item if isinstance(item, (bytes, bytearray)) else b64d(item)))
         for p in r.pages: w.add_page(p)
-        if d.get("_prog"): d["_prog"](_k * 100 // max(1, len(d["pdfs"])))
+        if d.get("_prog"): d["_prog"](_k * 100 // max(1, len(_items)))
     buf = io.BytesIO(); w.write(buf)
     return {"_raw_out": buf.getvalue(), "pages": len(w.pages)}
 
