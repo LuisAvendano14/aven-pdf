@@ -1362,6 +1362,30 @@ def api_cert_template(d):
         DL_FILES[tok] = (path, "plantilla_certificados.xlsx", time.time())
     return {"dlf": "/dlf/" + tok}
 
+
+def api_write_on_line(d):
+    """Escribe un texto SOBRE una línea ______ (rellenar el formulario):
+    centrado en la línea y apoyado en ella, sin moverla ni borrarla."""
+    doc = pymupdf.open(stream=P(d), filetype="pdf")
+    if d.get("password") and doc.authenticate(d["password"]) <= 0:
+        raise ValueError("La contraseña no abre este PDF: revísala en el campo de Acceso (pestaña Archivo)")
+    page = doc[int(d.get("page", 0))]
+    r = [float(v) for v in d["rect"]]
+    text = (d.get("text") or "").strip()
+    if not text: raise ValueError("Escribe primero el texto que va sobre la línea")
+    size = float(d.get("size") or 11)
+    fn = "hebo" if d.get("bold") else "helv"
+    col = tuple(float(v) for v in (d.get("color") or [0, 0, 0]))
+    line_w = max(10.0, r[2] - r[0])
+    max_w = min(page.rect.width - 48, line_w * 1.8)
+    while size > 6.5 and pymupdf.get_text_length(text, fontname=fn, fontsize=size) > max_w:
+        size -= 0.5
+    tw = pymupdf.get_text_length(text, fontname=fn, fontsize=size)
+    cx = (r[0] + r[2]) / 2.0
+    ox = max(12.0, min(cx - tw / 2.0, page.rect.width - tw - 12))
+    page.insert_text((ox, r[3] - 1.2), text, fontsize=size, fontname=fn, color=col)
+    return {"_raw_out": doc.tobytes(), "pages": doc.page_count}
+
 def api_job_start(d):
     op = d.get("op") or ""
     fn = APIS.get(op)
@@ -1457,6 +1481,7 @@ APIS = {"/api/open": api_open, "/api/info": api_info, "/api/render": api_render,
     "/api/object_at": api_object_at,
     "/api/delete_object": api_delete_object,
     "/api/restyle_object": api_restyle_object,
+    "/api/write_on_line": api_write_on_line,
         "/api/place_image": api_place_image, "/api/draw_strokes": api_draw_strokes,
         "/api/job_start": api_job_start, "/api/job_status": api_job_status,
         "/api/job_cancel": api_job_cancel}
