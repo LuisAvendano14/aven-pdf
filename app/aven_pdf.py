@@ -1260,6 +1260,12 @@ def api_object_at(d):
     if not t.get("found"):
         _d2 = dict(d); _d2["tol"] = 14
         t = api_text_at(_d2)
+    if not t.get("found"):
+        # Tercera pasada generosa (Luis, 2026-11-20): si hay texto cerca,
+        # el clic es para EDITAR EL TEXTO, no para el dibujo que lo tapa
+        # (borde de tabla o recuadro); el dibujo solo gana sin texto cerca.
+        _d3 = dict(d); _d3["tol"] = 30
+        t = api_text_at(_d3)
     if t.get("found"):
         txt = (t.get("text") or "").strip()
         blank = bool(txt) and all(ch in "_—–-.· " for ch in txt)
