@@ -618,6 +618,25 @@ def api_text_at(d):
     pick = best or near
     if not pick: return {"found": False, "page_w": W, "page_h": H}
     line, r, text = pick
+    caret = None
+    try:
+        for rb in page.get_text("rawdict")["blocks"]:
+            if rb.get("type") != 0: continue
+            for rl in rb["lines"]:
+                rr = pymupdf.Rect(rl["bbox"])
+                if abs(rr.x0 - r.x0) < 1.5 and abs(rr.y0 - r.y0) < 1.5 and abs(rr.x1 - r.x1) < 1.5:
+                    chars = []
+                    for sp in rl["spans"]: chars.extend(sp["chars"])
+                    if chars:
+                        if abs((rl.get("dir") or (1, 0))[0]) > 0.5:
+                            caret = sum(1 for c in chars if (c["bbox"][0] + c["bbox"][2]) / 2 < pt.x)
+                        else:
+                            caret = sum(1 for c in chars if (c["bbox"][1] + c["bbox"][3]) / 2 < pt.y)
+                    break
+            if caret is not None: break
+    except Exception:
+        caret = None
+    if caret is not None: caret = max(0, min(caret, len(text)))
     spans = line["spans"]
     dom = max(spans, key=lambda s: len(s["text"]))
     o = spans[0]["origin"]; col = dom["color"]
@@ -627,6 +646,7 @@ def api_text_at(d):
             "origin": [o[0], o[1]], "size": dom["size"], "font": dom["font"],
             "color": [(col >> 16 & 255) / 255, (col >> 8 & 255) / 255, (col & 255) / 255],
             "dir": [dv[0], dv[1]],
+            "caret": caret,
             "bold": bool(_fl & 16) or any(k in _fn for k in ("bold", "black", "heavy")),
             "italic": bool(_fl & 2) or ("italic" in _fn) or ("oblique" in _fn),
             "page_w": W, "page_h": H}
@@ -1264,7 +1284,7 @@ def api_object_at(d):
         # Tercera pasada generosa (Luis, 2026-11-20): si hay texto cerca,
         # el clic es para EDITAR EL TEXTO, no para el dibujo que lo tapa
         # (borde de tabla o recuadro); el dibujo solo gana sin texto cerca.
-        _d3 = dict(d); _d3["tol"] = 30
+        _d3 = dict(d); _d3["tol"] = 40
         t = api_text_at(_d3)
     if t.get("found"):
         txt = (t.get("text") or "").strip()
